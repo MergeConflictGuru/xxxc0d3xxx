@@ -1,0 +1,71 @@
+{
+  "name": "hot-tabs",
+  "displayName": "Hot Tabs",
+  "description": "Reorder VS Code tabs by most edited files in recent Git history and pin the top tabs.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:hotTabs.reorderAndPin"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "hotTabs.reorderAndPin",
+        "title": "Hot Tabs: Reorder and Pin by Git Edit History"
+      }
+    ],
+    "configuration": {
+      "title": "Hot Tabs",
+      "properties": {
+        "hotTabs.days": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "description": "How many days of Git history to use when scoring open tabs."
+        },
+        "hotTabs.pinCount": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "How many of the hottest tabs to pin after reordering."
+        },
+        "hotTabs.includeZeroScoreTabs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep open text tabs that have no Git changes in the reorder operation, placing them after scored tabs."
+        },
+        "hotTabs.runOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically reorder and pin tabs once when VS Code finishes starting up."
+        },
+        "hotTabs.automaticRunIntervalMinutes": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "description": "How often to automatically reorder and pin tabs, in minutes. Set to 0 to disable recurring automatic runs."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out hot-tabs.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5"
+  }
+}

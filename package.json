@@ -1,0 +1,20 @@
+{
+  "name": "local-vscode-extensions",
+  "private": true,
+  "description": "Build orchestration for four independently packaged VS Code extensions.",
+  "scripts": {
+    "install:all": "npm --prefix Automato install --yes && npm --prefix context-copy-search install --yes && npm --prefix hot-tabs install --yes && npm --prefix pickaxe install --yes",
+    "build:automato": "npm --prefix Automato run compile",
+    "build:context-copy-search": "npm --prefix context-copy-search run compile",
+    "build:hot-tabs": "npm --prefix hot-tabs run compile",
+    "build:pickaxe": "npm --prefix pickaxe run compile",
+    "build:all": "npm run build:automato && npm run build:context-copy-search && npm run build:hot-tabs && npm run build:pickaxe",
+    "test:all": "npm --prefix Automato test && npm --prefix context-copy-search test && npm run build:hot-tabs && npm run build:pickaxe",
+    "package:automato": "npm --prefix Automato run package",
+    "package:context-copy-search": "npm --prefix context-copy-search run package",
+    "package:hot-tabs": "npm --prefix hot-tabs run package",
+    "package:pickaxe": "npm --prefix pickaxe run package",
+    "package:all": "npm run package:automato && npm run package:context-copy-search && npm run package:hot-tabs && npm run package:pickaxe"
+  }
+}
+

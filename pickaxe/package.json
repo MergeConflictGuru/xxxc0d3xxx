@@ -1,0 +1,39 @@
+{
+  "name": "git-pickaxe-diff",
+  "displayName": "Git Pickaxe Diff",
+  "description": "Visual diff for files matching Git pickaxe (-S) searches.",
+  "version": "1.0.0",
+  "publisher": "your-name",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Version Control"
+  ],
+  "activationEvents": [
+    "onCommand:git-pickaxe-diff.search"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "git-pickaxe-diff.search",
+        "title": "Git Pickaxe: Search History & Diff"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out git-pickaxe-diff.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^16.11.7",
+    "@types/vscode": "^1.70.0",
+    "typescript": "^4.5.4"
+  },
+  "dependencies": {
+    "@vscode/vsce": "^3.9.2"
+  }
+}

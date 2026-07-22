@@ -1,0 +1,151 @@
+{
+  "name": "context-copy-search",
+  "displayName": "Context Copy Search",
+  "description": "Search text across workspace files, preview results, and copy full containing functions/classes with source annotations.",
+  "version": "0.8.0",
+  "publisher": "local-dev",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:contextCopySearch.previewMatches",
+    "onCommand:contextCopySearch.searchAndCopy",
+    "onCommand:contextCopySearch.search",
+    "onCommand:contextCopySearch.copyAll",
+    "onCommand:contextCopySearch.refresh",
+    "onCommand:contextCopySearch.openMatch",
+    "onCommand:contextCopySearch.openFileResult",
+    "onCommand:contextCopySearch.showDiagnostics",
+    "onCommand:contextCopySearch.resetFilters",
+    "onView:contextCopySearch.results"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "contextCopySearch.previewMatches",
+        "title": "Context Copy Search: Preview Matches"
+      },
+      {
+        "command": "contextCopySearch.searchAndCopy",
+        "title": "Context Copy Search: Search and Copy Contexts"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "contextCopySearch.results",
+          "name": "Context Search Results",
+          "contextualTitle": "Context Search Results"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "contextCopySearch.results",
+        "contents": "Preview workspace matches, or search and immediately copy containing functions/classes with source annotations.\n[Preview Matches](command:contextCopySearch.previewMatches) \u00b7 [Search and Copy Contexts](command:contextCopySearch.searchAndCopy)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "contextCopySearch.previewMatches",
+          "when": "view == contextCopySearch.results",
+          "group": "navigation@1"
+        },
+        {
+          "command": "contextCopySearch.searchAndCopy",
+          "when": "view == contextCopySearch.results",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Context Copy Search",
+      "properties": {
+        "contextCopySearch.includeGlob": {
+          "type": "string",
+          "default": "",
+          "description": "Comma-separated glob(s) of files to search. Empty means all searchable workspace files, closest to normal VS Code Search."
+        },
+        "contextCopySearch.excludeGlob": {
+          "type": "string",
+          "default": "",
+          "description": "Comma-separated extra glob(s) to exclude. Empty is recommended; VS Code search.exclude/files.exclude and ignore-file settings are mirrored separately."
+        },
+        "contextCopySearch.caseSensitive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether text search is case-sensitive."
+        },
+        "contextCopySearch.maxFiles": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 1,
+          "description": "Maximum number of files to scan."
+        },
+        "contextCopySearch.maxMatches": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1,
+          "description": "Maximum number of matches to collect. This is a safety cap; increase it for very large searches."
+        },
+        "contextCopySearch.maxFileBytes": {
+          "type": "number",
+          "default": 1000000,
+          "minimum": 10000,
+          "description": "Skip files larger than this many bytes."
+        },
+        "contextCopySearch.fallbackContextLines": {
+          "type": "number",
+          "default": 8,
+          "minimum": 0,
+          "description": "Lines before/after a match when no function/class can be inferred."
+        },
+        "contextCopySearch.useVSCodeSearch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Deprecated setting kept for compatibility. It is ignored; this extension now avoids VS Code proposed APIs."
+        },
+        "contextCopySearch.respectIgnoreFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "When using ripgrep, respect .gitignore, .ignore, global ignore files, and parent ignore files."
+        },
+        "contextCopySearch.searchEngine": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "ripgrep",
+            "fallback"
+          ],
+          "default": "auto",
+          "description": "Search engine to use. auto prefers bundled ripgrep, then ripgrep from PATH, then the slow fallback scanner. No VS Code proposed APIs are used."
+        },
+        "contextCopySearch.searchHidden": {
+          "type": "boolean",
+          "default": false,
+          "description": "When using ripgrep, include hidden files and directories. Keep false to behave closer to normal VS Code Search."
+        },
+        "contextCopySearch.insertMatchMarkers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Insert comment markers above every matching source line inside copied context blocks, so every individual occurrence is visible even when multiple matches share one function/class."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node --check extension.js",
+    "check": "node --check extension.js",
+    "test": "node --check extension.js && node test/smoke-rg.js",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out context-copy-search.vsix"
+  },
+  "dependencies": {
+    "@vscode/ripgrep": "^1.15.0"
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "name": "automato",
+  "displayName": "Automato",
+  "description": "Copy the active file for AI as both a file and text, then safely detect, review, repair, and apply copied unified diffs.",
+  "version": "0.1.5",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Version Control"
+  ],
+  "keywords": [
+    "patch",
+    "clipboard",
+    "AI",
+    "unified diff",
+    "git apply"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:automato.copyActiveFile",
+    "onCommand:automato.toggleWatcher",
+    "onCommand:automato.inspectClipboard",
+    "onCommand:automato.scanDownloads",
+    "onCommand:automato.showDiagnostics"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "automato.copyActiveFile",
+        "title": "Automato: Copy Active File for AI",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "automato.toggleWatcher",
+        "title": "Automato: Toggle Clipboard Patch Watcher"
+      },
+      {
+        "command": "automato.inspectClipboard",
+        "title": "Automato: Inspect Clipboard for Patch Now"
+      },
+      {
+        "command": "automato.scanDownloads",
+        "title": "Automato: Scan Downloads for Patches Now"
+      },
+      {
+        "command": "automato.showDiagnostics",
+        "title": "Automato: Show Diagnostics"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "automato.copyActiveFile",
+        "key": "ctrl+alt+shift+c",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "automato.copyActiveFile",
+          "group": "navigation@20",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "automato.copyActiveFile"
+        },
+        {
+          "command": "automato.toggleWatcher"
+        },
+        {
+          "command": "automato.inspectClipboard"
+        },
+        {
+          "command": "automato.scanDownloads"
+        },
+        {
+          "command": "automato.showDiagnostics"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Automato",
+      "properties": {
+        "automato.watchClipboard": {
+          "type": "boolean",
+          "default": true,
+          "description": "Watch copied text for Git-style unified diffs. Ordinary clipboard content is ignored."
+        },
+        "automato.pollIntervalMs": {
+          "type": "number",
+          "default": 650,
+          "minimum": 200,
+          "maximum": 10000,
+          "description": "Clipboard polling interval in milliseconds."
+        },
+        "automato.whitespaceMatching": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "exact",
+            "indent"
+          ],
+          "enumDescriptions": [
+            "Ignore leading indentation and trailing horizontal whitespace in common brace-based languages; use exact matching for indentation-sensitive and unknown formats.",
+            "Require exact whitespace in every file.",
+            "Ignore leading indentation and trailing horizontal whitespace in every file."
+          ],
+          "default": "auto",
+          "description": "How old-side patch text is matched against project files."
+        },
+        "automato.confirmBeforeApply": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a non-modal Apply/Ignore notification listing affected files before applying a valid patch."
+        },
+        "automato.stageChanges": {
+          "type": "boolean",
+          "default": false,
+          "description": "Apply with git apply --index, updating both the working tree and Git index."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node out/selftest.js",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out automato.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.8.0"
+  },
+  "files": [
+    "out/**",
+    "scripts/**",
+    "README.md",
+    "LICENSE"
+  ]
+}

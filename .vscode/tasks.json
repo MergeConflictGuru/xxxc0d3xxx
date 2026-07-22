@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "VSIX: Automato",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "package:automato"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "VSIX: Context Copy Search",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "package:context-copy-search"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "VSIX: Hot Tabs",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "package:hot-tabs"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "VSIX: Git Pickaxe Diff",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "package:pickaxe"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "VSIX: Build All",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "package:all"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}
