@@ -143,7 +143,7 @@
     "compile": "node --check extension.js",
     "check": "node --check extension.js",
     "test": "node --check extension.js && node test/smoke-rg.js",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out context-copy-search.vsix"
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
   },
   "dependencies": {
     "@vscode/ripgrep": "^1.15.0"

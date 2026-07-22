@@ -61,7 +61,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out hot-tabs.vsix"
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

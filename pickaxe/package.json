@@ -26,7 +26,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out git-pickaxe-diff.vsix"
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
   },
   "devDependencies": {
     "@types/node": "^16.11.7",

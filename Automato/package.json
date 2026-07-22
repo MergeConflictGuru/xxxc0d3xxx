@@ -135,7 +135,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test": "npm run compile && node out/selftest.js",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license --out automato.vsix"
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --skip-license"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
