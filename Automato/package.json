@@ -2,7 +2,7 @@
   "name": "automato",
   "displayName": "Automato",
   "description": "Copy the active file for AI as both a file and text, then safely detect, review, repair, and apply copied unified diffs.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -26,9 +26,8 @@
     "onStartupFinished",
     "onCommand:automato.copyActiveFile",
     "onCommand:automato.toggleWatcher",
-    "onCommand:automato.inspectClipboard",
-    "onCommand:automato.scanDownloads",
-    "onCommand:automato.showDiagnostics"
+    "onCommand:automato.showDiagnostics",
+	"onCommand:automato.rescanAll"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -40,15 +39,11 @@
       },
       {
         "command": "automato.toggleWatcher",
-        "title": "Automato: Toggle Clipboard Patch Watcher"
+        "title": "Automato: Toggle Patch Sources"
       },
       {
-        "command": "automato.inspectClipboard",
-        "title": "Automato: Inspect Clipboard for Patch Now"
-      },
-      {
-        "command": "automato.scanDownloads",
-        "title": "Automato: Scan Downloads for Patches Now"
+        "command": "automato.rescanAll",
+        "title": "Automato: Inspect Clipboard and Downloads for Patch Now"
       },
       {
         "command": "automato.showDiagnostics",
@@ -78,11 +73,8 @@
           "command": "automato.toggleWatcher"
         },
         {
-          "command": "automato.inspectClipboard"
-        },
-        {
-          "command": "automato.scanDownloads"
-        },
+          "command": "automato.rescanAll"
+		},
         {
           "command": "automato.showDiagnostics"
         }
@@ -91,10 +83,10 @@
     "configuration": {
       "title": "Automato",
       "properties": {
-        "automato.watchClipboard": {
+        "automato.watchPatchSources": {
           "type": "boolean",
           "default": true,
-          "description": "Watch copied text for Git-style unified diffs. Ordinary clipboard content is ignored."
+          "description": "Watch copied text and Downloads folders for Git-style unified diffs. Ordinary clipboard content is ignored."
         },
         "automato.pollIntervalMs": {
           "type": "number",

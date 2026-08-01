@@ -22,6 +22,15 @@ import {
 
 const execFileAsync = promisify(execFile);
 const OUTPUT_NAME = 'Automato';
+const RICKROLL_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+const YOUTUBE_URL_REGEX = /(^|[^\w.-])((?:(?:https?:)?\/\/)?(?:[\w-]+\.)?(?:youtube(?:-nocookie)?\.com|youtu\.be)(?::\d+)?(?:\/[^\s<>\"'`]*)?)/gim;
+
+function rickrollYoutubeLinks(text: string): string {
+    return text.replace(YOUTUBE_URL_REGEX, (_match, prefix: string, url: string) => {
+        const trailingPunctuation = /[),.;:!?\]}]+$/.exec(url)?.[0] ?? '';
+        return `${prefix}${RICKROLL_URL}${trailingPunctuation}`;
+    });
+}
 
 let watcher: ClipboardWatcher | undefined;
 let dispatchBus: PatchDispatchBus | undefined;
@@ -30,7 +39,7 @@ let statusBar: vscode.StatusBarItem | undefined;
 let output: vscode.OutputChannel | undefined;
 
 interface AutomatoConfiguration {
-    watchClipboard: boolean;
+    watchPatchSources: boolean;
     pollIntervalMs: number;
     whitespaceMatching: WhitespaceSetting;
     confirmBeforeApply: boolean;
@@ -40,7 +49,7 @@ interface AutomatoConfiguration {
 function configuration(): AutomatoConfiguration {
     const config = vscode.workspace.getConfiguration('automato');
     return {
-        watchClipboard: config.get<boolean>('watchClipboard', true),
+        watchPatchSources: config.get<boolean>('watchPatchSources', true),
         pollIntervalMs: Math.max(200, config.get<number>('pollIntervalMs', 650)),
         whitespaceMatching: config.get<WhitespaceSetting>('whitespaceMatching', 'auto'),
         confirmBeforeApply: config.get<boolean>('confirmBeforeApply', true),
@@ -52,6 +61,14 @@ function compactError(error: unknown, limit = 520): string {
     const text = error instanceof Error ? error.message : String(error);
     const oneLine = text.replace(/\s*\n\s*/g, ' ').trim();
     return oneLine.length <= limit ? oneLine : oneLine.slice(0, limit - 1).trimEnd() + '…';
+}
+
+function fullError(error: unknown): string {
+    return error instanceof Error ? error.stack ?? error.message : String(error);
+}
+
+function normalizeLineEndings(text: string): string {
+    return text.replace(/\r\n?/g, '\n');
 }
 
 function logDiagnostic(message: string): void {
@@ -481,9 +498,11 @@ async function copyActiveFile(context: vscode.ExtensionContext): Promise<void> {
 
     const pathHeader = await makePathHeader(document.languageId, relativePath);
     const originalText = document.getText();
-    const payload = pathHeader.header
+    const firstLine = originalText.split(/\r?\n/, 1)[0].replace(/^\uFEFF/, '');
+    let payload = pathHeader.header && firstLine !== pathHeader.header
         ? `${pathHeader.header}\n${originalText}`
         : originalText;
+    payload = rickrollYoutubeLinks(payload);
 
     await fs.mkdir(context.globalStorageUri.fsPath, { recursive: true });
     const existingEntries = await fs.readdir(context.globalStorageUri.fsPath, { withFileTypes: true });
@@ -520,7 +539,7 @@ function updateStatus(enabled: boolean, pending = false): void {
     statusBar.text = statusText(enabled, pending);
     statusBar.tooltip = enabled
         ? 'Automato is watching the clipboard and Downloads for patches. Click to pause.'
-        : 'Automato patch watchers are paused. Click to resume.';
+        : 'Automato patch sources are paused. Click to resume.';
     statusBar.show();
 }
 
@@ -561,13 +580,111 @@ function dirtyDocumentsForPrepared(prepared: PreparedPatch): vscode.TextDocument
 }
 
 async function prepareAgainstCurrentEditors(patch: string, repoRoot: string): Promise<PreparedPatch> {
-    const resolvedPatch = await resolveMissingPatchPaths(patch, repoRoot);
+    const resolvedPatch = await resolveMissingPatchPaths(normalizeLineEndings(patch), repoRoot);
     return preparePatch(
         resolvedPatch,
         repoRoot,
         configuration().whitespaceMatching,
         dirtyEditorContents(repoRoot)
     );
+}
+
+function editorTextForPath(contents: Map<string, string> | undefined, relativePath: string): string | undefined {
+    if (!contents) {
+        return undefined;
+    }
+    return contents.get(relativePath) ??
+        (process.platform === 'win32' ? contents.get(relativePath.toLowerCase()) : undefined);
+}
+
+function blockMatches(lines: string[], start: number, expected: string[]): boolean {
+    return expected.every((line, offset) => lines[start + offset] === line);
+}
+
+async function firstPatchMismatch(
+    patch: string,
+    repoRoot: string,
+    editorContents?: Map<string, string>
+): Promise<string | undefined> {
+    for (const section of patch.split(/(?=^diff --git )/m)) {
+        const oldPath = markerPath(section, '--- ');
+        const newPath = markerPath(section, '+++ ');
+        if (!oldPath) {
+            if (newPath && await fileExists(path.join(repoRoot, newPath))) {
+                return `Expected file: ${newPath} <not to exist>\nFound: <file already exists>`;
+            }
+            continue;
+        }
+
+        let currentText = editorTextForPath(editorContents, oldPath);
+        if (currentText === undefined) {
+            try {
+                currentText = await fs.readFile(path.join(repoRoot, oldPath), 'utf8');
+            } catch (error) {
+                if (isMissingFileError(error)) {
+                    return `Expected file: ${oldPath}\nFound: <file does not exist>`;
+                }
+                continue;
+            }
+        }
+
+        const currentLines = normalizeLineEndings(currentText).split('\n');
+        const patchLines = normalizeLineEndings(section).split('\n');
+        for (let index = 0; index < patchLines.length; index += 1) {
+            const hunkHeader = patchLines[index];
+            const header = /^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/.exec(hunkHeader);
+            if (!header) {
+                continue;
+            }
+
+            const oldStart = Number.parseInt(header[1], 10);
+            const expected: string[] = [];
+            for (index += 1; index < patchLines.length && !patchLines[index].startsWith('@@ '); index += 1) {
+                const prefix = patchLines[index][0];
+                if (prefix === ' ' || prefix === '-') {
+                    expected.push(patchLines[index].slice(1));
+                }
+            }
+            index -= 1;
+
+            const declaredStart = Math.max(0, oldStart - 1);
+            if (expected.length === 0 || blockMatches(currentLines, declaredStart, expected)) {
+                continue;
+            }
+            if (currentLines.some((_line, possibleStart) => blockMatches(currentLines, possibleStart, expected))) {
+                continue;
+            }
+
+            for (let offset = 0; offset < expected.length; offset += 1) {
+                const found = currentLines[declaredStart + offset];
+                if (found !== expected[offset]) {
+                    const lineNumber = oldStart + offset;
+                    return [
+                        `Patch mismatch in ${oldPath} at ${hunkHeader}:`,
+                        `Expected ${oldPath}:${lineNumber}: ${JSON.stringify(expected[offset])}`,
+                        `Found    ${oldPath}:${lineNumber}: ${found === undefined ? '<EOF>' : JSON.stringify(found)}`
+                    ].join('\n');
+                }
+            }
+        }
+    }
+    return undefined;
+}
+
+async function logPatchFailure(
+    label: string,
+    error: unknown,
+    patch: string,
+    repoRoot: string,
+    editorContents?: Map<string, string>
+): Promise<void> {
+    let mismatch: string | undefined;
+    try {
+        mismatch = await firstPatchMismatch(patch, repoRoot, editorContents);
+    } catch (diagnosticError) {
+        mismatch = `Could not inspect expected vs found text: ${fullError(diagnosticError)}`;
+    }
+    logDiagnostic(`${label}:\n${fullError(error)}${mismatch ? `\n\n${mismatch}` : ''}`);
 }
 
 async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ignored'> {
@@ -611,7 +728,7 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
     // Rebuild against disk after approval. This catches edits made while the notification
     // was pending and accommodates format-on-save changes before Git sees the patch.
     const finalPrepared = await preparePatch(
-        prepared.sourceText,
+        normalizeLineEndings(prepared.sourceText),
         prepared.repoRoot,
         config.whitespaceMatching
     );
@@ -625,11 +742,24 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
     return 'applied';
 }
 
-async function inspectClipboard(showNoPatchMessage: boolean): Promise<void> {
+async function rescanAll(): Promise<void> {
     if (!watcher) {
         throw new Error('The Automato clipboard watcher is not initialized.');
     }
-    await watcher.inspectNow(showNoPatchMessage);
+    if (!downloadsWatcher) {
+        throw new Error('The Automato Downloads watcher is not initialized.');
+    }
+
+    const generation = randomUUID();
+    const [, summary] = await Promise.all([
+        watcher.inspectNow(false, generation),
+        downloadsWatcher.inspectNow(false, generation)
+    ]);
+    await vscode.window.showInformationMessage(
+        `Rescanned clipboard and ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}; ` +
+        `found ${summary.validPatches} downloaded patch${summary.validPatches === 1 ? '' : 'es'} ` +
+        `among ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'}.`
+    );
 }
 
 class ClipboardReadError extends Error {
@@ -704,7 +834,13 @@ async function bestPatchCandidateInWindow(patch: string): Promise<PatchCandidate
                 exactPathCount: coverage.exact
             });
         } catch (error) {
-            output?.appendLine(`Patch does not match ${repoRoot}: ${compactError(error)}`);
+            await logPatchFailure(
+                `Patch does not match ${repoRoot}`,
+                error,
+                patch,
+                repoRoot,
+                dirtyEditorContents(repoRoot)
+            );
         }
     }
 
@@ -775,13 +911,16 @@ class PatchDispatchBus implements vscode.Disposable {
         this.fileWatcher = undefined;
     }
 
-    public async publish(patch: string, source: string): Promise<void> {
+    public async publish(patch: string, source: string, freshGeneration?: string): Promise<void> {
         await fs.mkdir(this.dispatchDirectory, { recursive: true });
-        const id = clipboardHash(patch);
+        const normalizedPatch = normalizeLineEndings(patch);
+        const id = clipboardHash(
+            freshGeneration === undefined ? normalizedPatch : `${normalizedPatch}\0${freshGeneration}`
+        );
         const dispatchPath = this.dispatchPath(id);
         const dispatch: PatchDispatch = {
             id,
-            patch,
+            patch: normalizedPatch,
             source,
             createdAt: Date.now(),
             publisherInstanceId: this.instanceId
@@ -967,7 +1106,12 @@ class PatchDispatchBus implements vscode.Disposable {
         } catch (error) {
             await fs.rm(this.claimPath(dispatch.id), { force: true });
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
-            logDiagnostic(`Claimed patch failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+            await logPatchFailure(
+                'Claimed patch failed',
+                error,
+                candidate.prepared.sourceText,
+                candidate.repoRoot
+            );
             revealDiagnostics();
             await vscode.window.showErrorMessage(`Automato refused the copied patch: ${compactError(error)}`);
         }
@@ -1124,6 +1268,7 @@ async function configuredDownloadsDirectories(): Promise<string[]> {
 }
 
 class DownloadsPatchWatcher implements vscode.Disposable {
+    private static readonly knownFilesStorageKey = 'automato.downloadSignatures.v1';
     private directories: string[] = [];
     private readonly fileWatchers = new Map<string, FSWatcher>();
     private scanTimer: NodeJS.Timeout | undefined;
@@ -1132,17 +1277,19 @@ class DownloadsPatchWatcher implements vscode.Disposable {
     private initialized = false;
     private scanning = false;
     private rescanRequested = false;
-    private startedAt = 0;
     private readonly knownFiles = new Map<string, string>();
 
-    public constructor(private readonly bus: PatchDispatchBus) {}
+    public constructor(
+        private readonly bus: PatchDispatchBus,
+        private readonly context: vscode.ExtensionContext
+    ) {}
 
     public async start(): Promise<void> {
         if (this.active) {
             return;
         }
         this.active = true;
-        this.startedAt = Date.now();
+        this.restoreKnownFiles();
         this.directories = await configuredDownloadsDirectories();
         if (this.directories.length === 0) {
             logDiagnostic('Downloads patch watcher could not find an existing Downloads directory.');
@@ -1190,12 +1337,35 @@ class DownloadsPatchWatcher implements vscode.Disposable {
         this.initialized = false;
         this.knownFiles.clear();
         this.directories = [];
-        if (configuration().watchClipboard) {
+        if (configuration().watchPatchSources) {
             await this.start();
         }
     }
 
-    public async inspectNow(): Promise<void> {
+    private restoreKnownFiles(): void {
+        this.knownFiles.clear();
+        const stored = this.context.globalState.get<Record<string, string>>(
+            DownloadsPatchWatcher.knownFilesStorageKey,
+            {}
+        );
+        for (const [filePath, signature] of Object.entries(stored)) {
+            if (typeof signature === 'string') {
+                this.knownFiles.set(filePath, signature);
+            }
+        }
+    }
+
+    private async persistKnownFiles(): Promise<void> {
+        await this.context.globalState.update(
+            DownloadsPatchWatcher.knownFilesStorageKey,
+            Object.fromEntries(this.knownFiles)
+        );
+    }
+
+    public async inspectNow(
+        showMessage = true,
+        freshGeneration = randomUUID()
+    ): Promise<DownloadsScanSummary> {
         while (this.scanning) {
             await delay(50);
         }
@@ -1206,18 +1376,21 @@ class DownloadsPatchWatcher implements vscode.Disposable {
             throw new Error('No existing Downloads directory could be located. Open Automato diagnostics for details.');
         }
 
-        const summary = await this.scan(false, true);
-        const message = summary.validPatches > 0
-            ? `Scanned ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}: ` +
-              `found and broadcast ${summary.validPatches} valid patch${summary.validPatches === 1 ? '' : 'es'} ` +
-              `among ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'}.`
-            : `Scanned ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}: ` +
-              `none of ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'} contained a Git-style patch.`;
-        await vscode.window.showInformationMessage(message, 'Show Diagnostics').then(choice => {
-            if (choice === 'Show Diagnostics') {
-                revealDiagnostics();
-            }
-        });
+        const summary = await this.scan(false, true, freshGeneration);
+        if (showMessage) {
+            const message = summary.validPatches > 0
+                ? `Scanned ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}: ` +
+                  `found and broadcast ${summary.validPatches} valid patch${summary.validPatches === 1 ? '' : 'es'} ` +
+                  `among ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'}.`
+                : `Scanned ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}: ` +
+                  `none of ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'} contained a Git-style patch.`;
+            await vscode.window.showInformationMessage(message, 'Show Diagnostics').then(choice => {
+                if (choice === 'Show Diagnostics') {
+                    revealDiagnostics();
+                }
+            });
+        }
+        return summary;
     }
 
     private scheduleScan(delayMs: number): void {
@@ -1233,7 +1406,11 @@ class DownloadsPatchWatcher implements vscode.Disposable {
         }, delayMs);
     }
 
-    private async scan(initial: boolean, forcePublish: boolean): Promise<DownloadsScanSummary> {
+    private async scan(
+        initial: boolean,
+        forcePublish: boolean,
+        freshGeneration?: string
+    ): Promise<DownloadsScanSummary> {
         const summary: DownloadsScanSummary = {
             directories: this.directories.length,
             candidates: 0,
@@ -1273,10 +1450,9 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                         const previous = this.knownFiles.get(filePath);
                         this.knownFiles.set(filePath, signature);
 
-                        const recentAtStartup = initial && stats.mtimeMs >= this.startedAt - 60_000;
                         const changed = previous !== undefined && previous !== signature;
-                        const newlyAppeared = !initial && this.initialized && previous === undefined;
-                        const shouldPublish = forcePublish || recentAtStartup || changed || newlyAppeared;
+                        const newlyAppeared = previous === undefined && (initial || this.initialized);
+                        const shouldPublish = forcePublish || changed || newlyAppeared;
                         if (!shouldPublish) {
                             continue;
                         }
@@ -1285,7 +1461,7 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                             `${forcePublish ? 'Manually inspecting' : 'Downloads detected'} ${filePath} ` +
                             `(${stats.size} bytes, modified ${new Date(stats.mtimeMs).toLocaleString()}).`
                         );
-                        if (await this.publishFile(filePath)) {
+                        if (await this.publishFile(filePath, freshGeneration)) {
                             summary.validPatches += 1;
                         }
                     } catch (error) {
@@ -1301,11 +1477,12 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                     this.knownFiles.delete(filePath);
                 }
             }
+            await this.persistKnownFiles();
             if (initial) {
                 logDiagnostic(
                     `Downloads initial scan found ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'} ` +
                     `across ${summary.directories} folder${summary.directories === 1 ? '' : 's'}. ` +
-                    'Files modified within the previous minute were inspected immediately; older files were remembered.'
+                    'Files new or changed since the previous scan were inspected immediately.'
                 );
             }
             this.initialized = true;
@@ -1328,7 +1505,7 @@ class DownloadsPatchWatcher implements vscode.Disposable {
         return extension === '.patch' || extension === '.diff' || extension === '.txt';
     }
 
-    private async publishFile(filePath: string): Promise<boolean> {
+    private async publishFile(filePath: string, freshGeneration?: string): Promise<boolean> {
         let lastError: unknown;
         for (let attempt = 0; attempt < 5; attempt += 1) {
             try {
@@ -1344,7 +1521,7 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                     return false;
                 }
                 logDiagnostic(`Valid patch extracted from ${filePath}; broadcasting it to every VS Code window.`);
-                await this.bus.publish(patch, filePath);
+                await this.bus.publish(patch, filePath, freshGeneration);
                 return true;
             } catch (error) {
                 lastError = error;
@@ -1369,6 +1546,8 @@ class ClipboardWatcher implements vscode.Disposable {
     private queued = false;
     private queuedForce = false;
     private queuedShowNoPatchMessage = false;
+    private queuedAllowWhenPaused = false;
+    private queuedFreshGeneration: string | undefined;
 
     public constructor(
         private readonly context: vscode.ExtensionContext,
@@ -1409,12 +1588,14 @@ class ClipboardWatcher implements vscode.Disposable {
         this.queued = false;
         this.queuedForce = false;
         this.queuedShowNoPatchMessage = false;
+        this.queuedAllowWhenPaused = false;
+        this.queuedFreshGeneration = undefined;
         updateStatus(false);
     }
 
     public async restart(): Promise<void> {
         this.stop();
-        if (configuration().watchClipboard) {
+        if (configuration().watchPatchSources) {
             await this.start();
         }
     }
@@ -1423,11 +1604,14 @@ class ClipboardWatcher implements vscode.Disposable {
         return this.enabled;
     }
 
-    public async inspectNow(showNoPatchMessage: boolean): Promise<void> {
+    public async inspectNow(
+        showNoPatchMessage: boolean,
+        freshGeneration = randomUUID()
+    ): Promise<void> {
         if (!vscode.workspace.isTrusted) {
             throw new Error('Automato is disabled until this workspace is trusted.');
         }
-        await this.runCheck(true, showNoPatchMessage, true);
+        await this.runCheck(true, showNoPatchMessage, true, freshGeneration);
     }
 
     private watchdogInterval(): number {
@@ -1459,7 +1643,8 @@ class ClipboardWatcher implements vscode.Disposable {
     private async runCheck(
         force: boolean,
         showNoPatchMessage: boolean,
-        allowWhenPaused = false
+        allowWhenPaused = false,
+        freshGeneration?: string
     ): Promise<void> {
         if ((!this.enabled && !allowWhenPaused) || !vscode.workspace.isTrusted) {
             return;
@@ -1468,6 +1653,8 @@ class ClipboardWatcher implements vscode.Disposable {
             this.queued = true;
             this.queuedForce = this.queuedForce || force;
             this.queuedShowNoPatchMessage = this.queuedShowNoPatchMessage || showNoPatchMessage;
+            this.queuedAllowWhenPaused = this.queuedAllowWhenPaused || allowWhenPaused;
+            this.queuedFreshGeneration = freshGeneration ?? this.queuedFreshGeneration;
             return;
         }
 
@@ -1490,7 +1677,7 @@ class ClipboardWatcher implements vscode.Disposable {
                 return;
             }
 
-            await this.bus.publish(patch, 'clipboard');
+            await this.bus.publish(patch, 'clipboard', freshGeneration);
             this.rememberHash(hash);
         } catch (error) {
             if (error instanceof ClipboardReadError) {
@@ -1504,14 +1691,23 @@ class ClipboardWatcher implements vscode.Disposable {
         } finally {
             this.busy = false;
             updateStatus(this.enabled);
-            if (this.queued && this.enabled) {
+            if (this.queued && (this.enabled || this.queuedAllowWhenPaused)) {
                 const queuedForce = this.queuedForce;
                 const queuedShow = this.queuedShowNoPatchMessage;
+                const queuedAllowWhenPaused = this.queuedAllowWhenPaused;
+                const queuedFreshGeneration = this.queuedFreshGeneration;
                 this.queued = false;
                 this.queuedForce = false;
                 this.queuedShowNoPatchMessage = false;
+                this.queuedAllowWhenPaused = false;
+                this.queuedFreshGeneration = undefined;
                 setTimeout(() => {
-                    void this.runCheck(queuedForce, queuedShow);
+                    void this.runCheck(
+                        queuedForce,
+                        queuedShow,
+                        queuedAllowWhenPaused,
+                        queuedFreshGeneration
+                    );
                 }, 50);
             }
         }
@@ -1545,18 +1741,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     dispatchBus = new PatchDispatchBus();
     watcher = new ClipboardWatcher(context, dispatchBus);
-    downloadsWatcher = new DownloadsPatchWatcher(dispatchBus);
+    downloadsWatcher = new DownloadsPatchWatcher(dispatchBus, context);
     context.subscriptions.push(dispatchBus, watcher, downloadsWatcher);
     await dispatchBus.start();
 
-    const startSources = async (): Promise<void> => {
-        await watcher?.start();
-        await downloadsWatcher?.start();
-    };
-    const stopSources = (): void => {
-        watcher?.stop();
-        downloadsWatcher?.stop();
-    };
     const restartSources = async (): Promise<void> => {
         await watcher?.restart();
         await downloadsWatcher?.restart();
@@ -1564,27 +1752,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     context.subscriptions.push(
         vscode.commands.registerCommand('automato.copyActiveFile', () => runCommand(() => copyActiveFile(context))),
-        vscode.commands.registerCommand('automato.inspectClipboard', () => runCommand(() => inspectClipboard(true))),
-        vscode.commands.registerCommand('automato.scanDownloads', () => runCommand(async () => {
-            if (!downloadsWatcher) {
-                throw new Error('The Automato Downloads watcher is not initialized.');
-            }
-            await downloadsWatcher.inspectNow();
-        })),
+        vscode.commands.registerCommand('automato.rescanAll', () => runCommand(rescanAll)),
         vscode.commands.registerCommand('automato.showDiagnostics', () => revealDiagnostics()),
         vscode.commands.registerCommand('automato.toggleWatcher', () => runCommand(async () => {
             if (!watcher) {
                 return;
             }
             if (watcher.isEnabled()) {
-                stopSources();
+                watcher.stop();
+                downloadsWatcher?.stop();
                 await vscode.workspace.getConfiguration('automato').update(
-                    'watchClipboard', false, vscode.ConfigurationTarget.Global
+                    'watchPatchSources', false, vscode.ConfigurationTarget.Global
                 );
             } else {
-                await startSources();
+                await watcher.start();
+                await downloadsWatcher?.start();
                 await vscode.workspace.getConfiguration('automato').update(
-                    'watchClipboard', true, vscode.ConfigurationTarget.Global
+                    'watchPatchSources', true, vscode.ConfigurationTarget.Global
                 );
             }
         })),
@@ -1595,10 +1779,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         })
     );
 
-    if (configuration().watchClipboard) {
-        await startSources();
+    if (configuration().watchPatchSources) {
+        await watcher.start();
+        await downloadsWatcher.start();
     } else {
         updateStatus(false);
+        logDiagnostic('Clipboard and Downloads patch watchers are disabled by automato.watchPatchSources.');
     }
 }
 

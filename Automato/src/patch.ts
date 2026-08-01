@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile);
 export type ChangeKind = 'modify' | 'add' | 'delete';
 export type WhitespaceSetting = 'auto' | 'exact' | 'indent';
 type MatchMode = 'exact' | 'indent';
+type LineEnding = '\n' | '\r\n';
 
 export class PatchError extends Error {
     public constructor(message: string) {
@@ -38,6 +39,7 @@ export interface FilePatch {
     kind: ChangeKind;
     hunks: Hunk[];
     mode: MatchMode;
+    lineEnding: LineEnding;
     diffHeaderIndex?: number;
     oldPathRecordIndex: number;
     newPathRecordIndex: number;
@@ -52,12 +54,19 @@ export interface PreparedPatch {
     usedEditorBuffers: string[];
 }
 
+interface PathMatchScore {
+    overlap: number;
+    extra: number;
+    suffix: number;
+}
+
 interface LocatedCandidate {
     path: string;
     mode: MatchMode;
     matches: Array<{ index: number; actualOldLines: string[] }>;
     usedEditorBuffer: boolean;
-    suffixScore: number;
+    lineEnding?: LineEnding;
+    pathScore: PathMatchScore;
 }
 
 const INDENT_INSENSITIVE_EXTENSIONS = new Set([
@@ -78,6 +87,78 @@ const EXACT_FILENAMES = new Set(['makefile', 'gnumakefile', 'bsdmakefile']);
 
 export function normalizeNewlines(text: string): string {
     return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function detectLineEnding(text: string): LineEnding | undefined {
+    let crlf = 0;
+    let lf = 0;
+    for (let index = 0; index < text.length; index += 1) {
+        if (text[index] !== '\n') {
+            continue;
+        }
+        if (index > 0 && text[index - 1] === '\r') {
+            crlf += 1;
+        } else {
+            lf += 1;
+        }
+    }
+    if (crlf === 0 && lf === 0) {
+        return undefined;
+    }
+    return crlf >= lf ? '\r\n' : '\n';
+}
+
+async function gitConfigValue(repoRoot: string, key: string): Promise<string | undefined> {
+    try {
+        const result = await execFileAsync(
+            'git', ['-C', repoRoot, 'config', '--get', key],
+            { windowsHide: true, maxBuffer: 1024 * 1024, encoding: 'utf8' }
+        );
+        const value = result.stdout.trim();
+        return value || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function gitEolAttribute(repoRoot: string, relativePath: string): Promise<string | undefined> {
+    try {
+        const result = await execFileAsync(
+            'git', ['-C', repoRoot, 'check-attr', '-z', 'eol', '--', relativePath],
+            { windowsHide: true, maxBuffer: 1024 * 1024, encoding: 'utf8' }
+        );
+        const value = result.stdout.split('\0')[2];
+        return value && value !== 'unspecified' && value !== 'unset' ? value : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function repositoryLineEnding(repoRoot: string, relativePath: string): Promise<LineEnding> {
+    const attribute = (await gitEolAttribute(repoRoot, relativePath))?.toLowerCase();
+    if (attribute === 'crlf') {
+        return '\r\n';
+    }
+    if (attribute === 'lf') {
+        return '\n';
+    }
+
+    const autoCrlf = (await gitConfigValue(repoRoot, 'core.autocrlf'))?.toLowerCase();
+    if (autoCrlf === 'true') {
+        return '\r\n';
+    }
+    if (autoCrlf === 'input') {
+        return '\n';
+    }
+
+    const configuredEol = (await gitConfigValue(repoRoot, 'core.eol'))?.toLowerCase();
+    if (configuredEol === 'crlf') {
+        return '\r\n';
+    }
+    if (configuredEol === 'native') {
+        return process.platform === 'win32' ? '\r\n' : '\n';
+    }
+    return '\n';
 }
 
 function splitLinesKeepEnds(text: string): string[] {
@@ -416,6 +497,7 @@ export function parseGitPatch(patchText: string): { lines: string[]; files: File
             kind,
             hunks,
             mode: 'exact',
+            lineEnding: '\n',
             diffHeaderIndex: diffHeader,
             oldPathRecordIndex: oldRecord,
             newPathRecordIndex: newRecord
@@ -488,50 +570,78 @@ function mapLookup(contents: ReadonlyMap<string, string> | undefined, relativePa
         (process.platform === 'win32' ? contents?.get(normalized.toLowerCase()) : undefined);
 }
 
-async function listRepositoryFiles(repoRoot: string): Promise<string[]> {
+async function repositoryTopLevel(directory: string): Promise<string> {
     try {
         const result = await execFileAsync(
-            'git', ['-C', repoRoot, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-            { windowsHide: true, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }
+            'git', ['-C', directory, 'rev-parse', '--show-toplevel'],
+            { windowsHide: true, maxBuffer: 1024 * 1024, encoding: 'utf8' }
         );
-        return result.stdout.toString('utf8').split('\0').filter(Boolean).map(file => file.replace(/\\/g, '/'));
-    } catch {
-        const result: string[] = [];
-        async function walk(directory: string, relativeDirectory: string): Promise<void> {
-            const entries = await fs.readdir(directory, { withFileTypes: true });
-            for (const entry of entries) {
-                if (entry.name === '.git') {
-                    continue;
-                }
-                const relative = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
-                if (entry.isDirectory()) {
-                    await walk(path.join(directory, entry.name), relative);
-                } else if (entry.isFile()) {
-                    result.push(relative);
-                }
-            }
-        }
-        await walk(repoRoot, '');
-        return result;
+        return path.resolve(result.stdout.trim());
+    } catch (error) {
+        const details = error as { stderr?: string; stdout?: string; message?: string };
+        throw new PatchError(
+            `Cannot find repository root:\n${(details.stderr || details.stdout || details.message || String(error)).trim()}`
+        );
     }
 }
 
-function commonSuffixScore(leftPath: string, rightPath: string): number {
-    const left = leftPath.replace(/\\/g, '/').split('/');
-    const right = rightPath.replace(/\\/g, '/').split('/');
+async function listTrackedRepositoryFiles(repoRoot: string): Promise<string[]> {
+    try {
+        const result = await execFileAsync(
+            'git', ['-C', repoRoot, 'ls-files', '--cached', '--full-name', '-z'],
+            { windowsHide: true, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }
+        );
+        return result.stdout.toString('utf8').split('\0').filter(Boolean).map(file => file.replace(/\\/g, '/'));
+    } catch (error) {
+        const details = error as { stderr?: string; stdout?: string; message?: string };
+        throw new PatchError(
+            `Cannot list tracked repository files:\n${(details.stderr || details.stdout || details.message || String(error)).trim()}`
+        );
+    }
+}
+
+function normalizedPathParts(filePath: string): string[] {
+    const parts = filePath.replace(/\\/g, '/').split('/').filter(Boolean);
+    return process.platform === 'win32' ? parts.map(part => part.toLowerCase()) : parts;
+}
+
+function commonSuffixScore(left: string[], right: string[]): number {
     let score = 0;
-    while (score < left.length && score < right.length) {
-        const leftPart = left[left.length - 1 - score];
-        const rightPart = right[right.length - 1 - score];
-        const equal = process.platform === 'win32'
-            ? leftPart.toLowerCase() === rightPart.toLowerCase()
-            : leftPart === rightPart;
-        if (!equal) {
-            break;
-        }
+    while (score < left.length && score < right.length &&
+        left[left.length - 1 - score] === right[right.length - 1 - score]) {
         score += 1;
     }
     return score;
+}
+
+function pathMatchScore(wantedPath: string, candidatePath: string): PathMatchScore {
+    const wanted = normalizedPathParts(wantedPath);
+    const candidate = normalizedPathParts(candidatePath);
+    const lcs = new Array<number>(candidate.length + 1).fill(0);
+
+    for (const wantedPart of wanted) {
+        let diagonal = 0;
+        for (let index = 1; index <= candidate.length; index += 1) {
+            const above = lcs[index];
+            lcs[index] = wantedPart === candidate[index - 1]
+                ? diagonal + 1
+                : Math.max(lcs[index], lcs[index - 1]);
+            diagonal = above;
+        }
+    }
+
+    const overlap = lcs[candidate.length];
+    return {
+        overlap,
+        extra: candidate.length - overlap,
+        suffix: commonSuffixScore(wanted, candidate)
+    };
+}
+
+function comparePathScores(left: PathMatchScore, right: PathMatchScore): number {
+    return left.overlap - right.overlap ||
+        right.extra - left.extra ||
+        left.suffix - right.suffix;
 }
 
 function locateHunksInText(filePatch: FilePatch, targetText: string, mode: MatchMode, displayPath: string):
@@ -610,6 +720,7 @@ async function locateFilePatch(
             throw new PatchError(`New-file patch for ${filePatch.path} must contain exactly one hunk.`);
         }
         filePatch.mode = modeForPath(filePatch.path, configuredMode);
+        filePatch.lineEnding = await repositoryLineEnding(repoRoot, filePatch.path);
         filePatch.hunks[0].matchIndex = 0;
         filePatch.hunks[0].actualOldLines = [];
         return false;
@@ -617,9 +728,8 @@ async function locateFilePatch(
 
     const wantedPath = filePatch.path.replace(/\\/g, '/');
     const wantedBasename = path.posix.basename(wantedPath);
-    const allFiles = repositoryFiles ?? await listRepositoryFiles(repoRoot);
+    const allFiles = repositoryFiles ?? await listTrackedRepositoryFiles(repoRoot);
     const candidates = new Set<string>();
-    candidates.add(wantedPath);
     for (const file of allFiles) {
         const sameName = process.platform === 'win32'
             ? path.posix.basename(file).toLowerCase() === wantedBasename.toLowerCase()
@@ -628,16 +738,6 @@ async function locateFilePatch(
             candidates.add(file);
         }
     }
-    for (const file of editorContents?.keys() ?? []) {
-        const normalized = file.replace(/\\/g, '/');
-        const sameName = process.platform === 'win32'
-            ? path.posix.basename(normalized).toLowerCase() === wantedBasename.toLowerCase()
-            : path.posix.basename(normalized) === wantedBasename;
-        if (sameName) {
-            candidates.add(normalized);
-        }
-    }
-
     const viable: LocatedCandidate[] = [];
     let exactFailure: PatchError | undefined;
     for (const candidate of candidates) {
@@ -652,7 +752,8 @@ async function locateFilePatch(
                 mode,
                 matches: locateHunksInText(filePatch, source.text, mode, candidate),
                 usedEditorBuffer: source.usedEditorBuffer,
-                suffixScore: commonSuffixScore(wantedPath, candidate)
+                lineEnding: detectLineEnding(source.text),
+                pathScore: pathMatchScore(wantedPath, candidate)
             });
         } catch (error) {
             if (candidate === wantedPath && error instanceof PatchError) {
@@ -670,8 +771,13 @@ async function locateFilePatch(
         throw new PatchError(`No project file matching ${wantedPath} contains all patch hunks uniquely.${tried}`);
     }
 
-    const bestScore = Math.max(...viable.map(candidate => candidate.suffixScore));
-    const best = viable.filter(candidate => candidate.suffixScore === bestScore);
+    let bestScore = viable[0].pathScore;
+    for (const candidate of viable.slice(1)) {
+        if (comparePathScores(candidate.pathScore, bestScore) > 0) {
+            bestScore = candidate.pathScore;
+        }
+    }
+    const best = viable.filter(candidate => comparePathScores(candidate.pathScore, bestScore) === 0);
     if (best.length !== 1) {
         throw new PatchError(
             `Patch path ${wantedPath} is ambiguous. These equally good files all match the hunks: ` +
@@ -682,6 +788,7 @@ async function locateFilePatch(
     const chosen = best[0];
     filePatch.path = chosen.path;
     filePatch.mode = chosen.mode;
+    filePatch.lineEnding = chosen.lineEnding ?? await repositoryLineEnding(repoRoot, chosen.path);
     if (filePatch.kind === 'modify') {
         filePatch.oldPath = chosen.path;
         filePatch.newPath = chosen.path;
@@ -750,8 +857,14 @@ function rewritePatch(lines: string[], files: FilePatch[]): string {
                 const prefix = line[0];
                 if (prefix === ' ' || prefix === '-') {
                     const actual = actualOldLines[oldCursor];
-                    corrected[bodyIndex] = prefix + actual + (actual.endsWith('\n') ? '' : '\n');
+                    const hasLogicalNewline = actual.endsWith('\n');
+                    const content = hasLogicalNewline ? actual.slice(0, -1) : actual;
+                    corrected[bodyIndex] = prefix + content + (hasLogicalNewline ? filePatch.lineEnding : '\n');
                     oldCursor += 1;
+                } else if (prefix === '+') {
+                    const hasNoNewlineMarker = lines[bodyIndex + 1]?.startsWith('\\ No newline at end of file') ?? false;
+                    const content = line.endsWith('\n') ? line.slice(0, -1) : line;
+                    corrected[bodyIndex] = content + (hasNoNewlineMarker ? '\n' : filePatch.lineEnding);
                 }
             }
             cumulativeDelta += hunk.newCount - hunk.oldCount;
@@ -767,11 +880,12 @@ export async function preparePatch(
     editorContents?: ReadonlyMap<string, string>
 ): Promise<PreparedPatch> {
     const parsed = parseGitPatch(patchText);
+    const repositoryRoot = await repositoryTopLevel(repoRoot);
     const usedEditorBuffers: string[] = [];
-    const repositoryFiles = await listRepositoryFiles(repoRoot);
+    const repositoryFiles = await listTrackedRepositoryFiles(repositoryRoot);
     for (const filePatch of parsed.files) {
         const usedEditor = await locateFilePatch(
-            repoRoot,
+            repositoryRoot,
             filePatch,
             whitespaceSetting,
             editorContents,
@@ -782,7 +896,7 @@ export async function preparePatch(
         }
     }
     return {
-        repoRoot,
+        repoRoot: repositoryRoot,
         sourceText: patchText,
         correctedText: rewritePatch(parsed.lines, parsed.files),
         files: parsed.files,
@@ -824,7 +938,7 @@ export async function checkPreparedPatch(prepared: PreparedPatch, stageChanges: 
 export async function applyPreparedPatch(prepared: PreparedPatch, stageChanges: boolean): Promise<void> {
     const patchPath = await writeTemporaryPatch(prepared.correctedText);
     try {
-        const base = ['-C', prepared.repoRoot, 'apply', '--unidiff-zero'];
+        const base = ['-C', prepared.repoRoot, 'apply', '--unidiff-zero', '--whitespace=nowarn'];
         if (stageChanges) {
             base.push('--index');
         }
@@ -836,6 +950,13 @@ export async function applyPreparedPatch(prepared: PreparedPatch, stageChanges: 
             windowsHide: true,
             maxBuffer: 16 * 1024 * 1024
         });
+        if (stageChanges) {
+            const paths = [...new Set(prepared.files.map(file => file.path))];
+            await execFileAsync('git', ['-C', prepared.repoRoot, 'add', '--all', '--', ...paths], {
+                windowsHide: true,
+                maxBuffer: 16 * 1024 * 1024
+            });
+        }
     } catch (error) {
         const details = error as { stderr?: string; stdout?: string; message?: string };
         throw new PatchError(

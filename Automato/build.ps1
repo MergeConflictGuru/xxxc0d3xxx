@@ -20,6 +20,32 @@ function Require-Command {
     }
 }
 
+function Resolve-VSCodeCli {
+    foreach ($CommandName in @("code.cmd", "code")) {
+        $Command = Get-Command $CommandName -ErrorAction SilentlyContinue
+        if ($Command) {
+            return $Command.Source
+        }
+    }
+
+    $RunningCode = Get-Process Code -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path } |
+        Select-Object -First 1
+    if ($RunningCode) {
+        $PortableCli = Join-Path (Split-Path -Parent $RunningCode.Path) "bin\code.cmd"
+        if (Test-Path $PortableCli -PathType Leaf) {
+            return $PortableCli
+        }
+    }
+
+    $InstalledCli = Join-Path $env:LOCALAPPDATA "Programs\Microsoft VS Code\bin\code.cmd"
+    if (Test-Path $InstalledCli -PathType Leaf) {
+        return $InstalledCli
+    }
+
+    throw "VS Code's command-line launcher was not found in PATH, beside a running portable Code.exe, or in the standard per-user installation."
+}
+
 Require-Command "node"
 Require-Command "npm"
 
@@ -113,12 +139,12 @@ Write-Host "Build completed:" -ForegroundColor Green
 Write-Host $VsixPath -ForegroundColor Green
 
 if ($Install) {
-    Require-Command "code"
+    $VSCodeCli = Resolve-VSCodeCli
 
     Write-Host ""
-    Write-Host "Installing into VS Code..."
+    Write-Host "Installing into VS Code with $VSCodeCli..."
 
-    & code --install-extension $VsixPath --force
+    & $VSCodeCli --install-extension $VsixPath --force
 
     if ($LASTEXITCODE -ne 0) {
         throw "VS Code installation failed with exit code $LASTEXITCODE."
@@ -127,6 +153,6 @@ if ($Install) {
     Write-Host "Automato installed. Reload VS Code." -ForegroundColor Green
 } else {
     Write-Host ""
-    Write-Host "To install it, run:"
-    Write-Host "code --install-extension `"$VsixPath`" --force"
+    Write-Host "To package and install it, run:"
+    Write-Host "powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Install"
 }

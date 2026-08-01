@@ -2,10 +2,17 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "VSIX: Automato",
+      "label": "VSIX: Automato (Package + Install)",
       "type": "shell",
-      "command": "npm",
-      "args": ["run", "package:automato"],
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\Automato\\build.ps1",
+        "-Install"
+      ],
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     },
