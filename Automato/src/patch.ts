@@ -585,17 +585,18 @@ async function repositoryTopLevel(directory: string): Promise<string> {
     }
 }
 
-async function listTrackedRepositoryFiles(repoRoot: string): Promise<string[]> {
+async function listRepositoryFiles(repoRoot: string): Promise<string[]> {
     try {
         const result = await execFileAsync(
-            'git', ['-C', repoRoot, 'ls-files', '--cached', '--full-name', '-z'],
+            'git',
+            ['-C', repoRoot, 'ls-files', '--cached', '--others', '--exclude-standard', '--full-name', '-z'],
             { windowsHide: true, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }
         );
         return result.stdout.toString('utf8').split('\0').filter(Boolean).map(file => file.replace(/\\/g, '/'));
     } catch (error) {
         const details = error as { stderr?: string; stdout?: string; message?: string };
         throw new PatchError(
-            `Cannot list tracked repository files:\n${(details.stderr || details.stdout || details.message || String(error)).trim()}`
+            `Cannot list repository files:\n${(details.stderr || details.stdout || details.message || String(error)).trim()}`
         );
     }
 }
@@ -728,7 +729,7 @@ async function locateFilePatch(
 
     const wantedPath = filePatch.path.replace(/\\/g, '/');
     const wantedBasename = path.posix.basename(wantedPath);
-    const allFiles = repositoryFiles ?? await listTrackedRepositoryFiles(repoRoot);
+    const allFiles = repositoryFiles ?? await listRepositoryFiles(repoRoot);
     const candidates = new Set<string>();
     for (const file of allFiles) {
         const sameName = process.platform === 'win32'
@@ -882,7 +883,7 @@ export async function preparePatch(
     const parsed = parseGitPatch(patchText);
     const repositoryRoot = await repositoryTopLevel(repoRoot);
     const usedEditorBuffers: string[] = [];
-    const repositoryFiles = await listTrackedRepositoryFiles(repositoryRoot);
+    const repositoryFiles = await listRepositoryFiles(repositoryRoot);
     for (const filePatch of parsed.files) {
         const usedEditor = await locateFilePatch(
             repositoryRoot,
