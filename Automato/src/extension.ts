@@ -86,30 +86,12 @@ async function copyDiagnostics(report = lastDiagnosticsReport): Promise<void> {
     await vscode.window.showInformationMessage('Patch diagnostics copied.');
 }
 
-let patchPromptTail: Promise<void> = Promise.resolve();
-let pendingPatchPrompts = 0;
-
-async function queuePatchPrompt<T>(action: () => Promise<T>): Promise<T> {
-    pendingPatchPrompts += 1;
-    const previous = patchPromptTail;
-    let release!: () => void;
-    patchPromptTail = new Promise<void>(resolve => {
-        release = resolve;
-    });
-
-    await previous;
-    try {
-        return await action();
-    } finally {
-        pendingPatchPrompts -= 1;
-        release();
-    }
-}
+let patchPromptActive = false;
 
 function showPatchRejection(message: string, report: string): void {
     // Diagnostics are already in Output. Never let an error notification hide or
     // block an Apply/Ignore prompt; a later valid patch must always take priority.
-    if (pendingPatchPrompts > 0) {
+    if (patchPromptActive) {
         return;
     }
     void vscode.window.showErrorMessage(message, 'Copy Diagnostics').then(choice => {
@@ -897,23 +879,27 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
         await checkPreparedPatch(prepared, config.stageChanges);
     }
 
-    if (config.confirmBeforeApply) {
-        updateStatus(true, true);
-        const compactFiles = prepared.files
-            .slice(0, 5)
-            .map(file => `${file.kind === 'add' ? '+' : file.kind === 'delete' ? '−' : '•'} ${file.path}`)
-            .join('  ');
-        const remaining = prepared.files.length > 5 ? `  …and ${prepared.files.length - 5} more` : '';
-        const choice = await vscode.window.showInformationMessage(
+    updateStatus(true, true);
+    patchPromptActive = true;
+    const compactFiles = prepared.files
+        .slice(0, 5)
+        .map(file => `${file.kind === 'add' ? '+' : file.kind === 'delete' ? '−' : '•'} ${file.path}`)
+        .join('  ');
+    const remaining = prepared.files.length > 5 ? `  …and ${prepared.files.length - 5} more` : '';
+    let choice: string | undefined;
+    try {
+        choice = await vscode.window.showInformationMessage(
             `Automato found a valid patch (${prepared.hunkCount} hunk${prepared.hunkCount === 1 ? '' : 's'}): ${compactFiles}${remaining}`,
             { modal: true },
             'Apply',
             'Ignore'
         );
+    } finally {
+        patchPromptActive = false;
         updateStatus(true, false);
-        if (choice !== 'Apply') {
-            return 'ignored';
-        }
+    }
+    if (choice !== 'Apply') {
+        return 'ignored';
     }
 
     const currentlyDirtyDocuments = dirtyDocumentsForPrepared(prepared);
@@ -1242,9 +1228,11 @@ class PatchDispatchBus implements vscode.Disposable {
                     continue;
                 }
                 this.processing.add(dispatch.id);
-                void this.processDispatch(dispatch).finally(() => {
+                try {
+                    await this.processDispatch(dispatch);
+                } finally {
                     this.processing.delete(dispatch.id);
-                });
+                }
             }
         } catch (error) {
             if (!isMissingFileError(error)) {
@@ -1303,6 +1291,13 @@ class PatchDispatchBus implements vscode.Disposable {
             }
         }
 
+        // Only the focused VS Code window may claim a valid patch. Otherwise a
+        // background window can own the dispatch and show the Apply dialog off-screen.
+        if (!vscode.window.state.focused) {
+            setTimeout(() => this.scheduleScan(0), 500);
+            return;
+        }
+
         if (!await this.dispatchIsCurrent(dispatch)) {
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
             return;
@@ -1316,7 +1311,7 @@ class PatchDispatchBus implements vscode.Disposable {
 
         try {
             publishDiagnostics(search.report);
-            await queuePatchPrompt(() => promptAndApply(candidate.prepared));
+            await promptAndApply(candidate.prepared);
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
             await this.removeDispatchFiles(dispatch.id);
         } catch (error) {
