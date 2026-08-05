@@ -16,7 +16,6 @@ import {
     PatchError,
     preparePatch,
     PreparedPatch,
-    summarizeFiles,
     WhitespaceSetting
 } from './patch';
 
@@ -37,6 +36,7 @@ let dispatchBus: PatchDispatchBus | undefined;
 let downloadsWatcher: DownloadsPatchWatcher | undefined;
 let statusBar: vscode.StatusBarItem | undefined;
 let output: vscode.OutputChannel | undefined;
+let lastDiagnosticsReport = '';
 
 interface AutomatoConfiguration {
     watchPatchSources: boolean;
@@ -63,10 +63,6 @@ function compactError(error: unknown, limit = 520): string {
     return oneLine.length <= limit ? oneLine : oneLine.slice(0, limit - 1).trimEnd() + '…';
 }
 
-function fullError(error: unknown): string {
-    return error instanceof Error ? error.stack ?? error.message : String(error);
-}
-
 function normalizeLineEndings(text: string): string {
     return text.replace(/\r\n?/g, '\n');
 }
@@ -76,8 +72,35 @@ function logDiagnostic(message: string): void {
     output?.appendLine(`[${timestamp}] ${message}`);
 }
 
-function revealDiagnostics(): void {
-    output?.show(true);
+function publishDiagnostics(report: string): string {
+    lastDiagnosticsReport = report.trim();
+    if (lastDiagnosticsReport) {
+        output?.appendLine(lastDiagnosticsReport);
+    }
+    return lastDiagnosticsReport;
+}
+
+async function copyDiagnostics(report = lastDiagnosticsReport): Promise<void> {
+    const text = report.trim() || 'No patch diagnostics are available.';
+    await vscode.env.clipboard.writeText(text);
+    await vscode.window.showInformationMessage('Patch diagnostics copied.');
+}
+
+let patchNotificationTail: Promise<void> = Promise.resolve();
+
+async function queuePatchNotification<T>(action: () => Promise<T>): Promise<T> {
+    const previous = patchNotificationTail;
+    let release!: () => void;
+    patchNotificationTail = new Promise<void>(resolve => {
+        release = resolve;
+    });
+
+    await previous;
+    try {
+        return await action();
+    } finally {
+        release();
+    }
 }
 
 async function gitRootForDirectory(directory: string): Promise<string> {
@@ -136,6 +159,31 @@ interface GitHeaderToken {
 interface MissingPatchPath {
     sectionIndex: number;
     path: string;
+}
+
+interface CandidateVerdict {
+    status: 'accepted' | 'rejected';
+    filePath: string;
+    reason?: string;
+    details?: string[];
+}
+
+interface PatchMismatch {
+    filePath: string;
+    reason: string;
+    details?: string[];
+}
+
+interface ResolvedPatch {
+    patch: string;
+    verdicts: CandidateVerdict[];
+}
+
+class PatchReportError extends PatchError {
+    public constructor(public readonly verdicts: CandidateVerdict[]) {
+        super('Patch rejected.');
+        this.name = 'PatchReportError';
+    }
 }
 
 function decodeGitHeaderToken(raw: string): string {
@@ -333,7 +381,7 @@ function commonSuffixComponents(left: string, right: string): number {
     return count;
 }
 
-function bestRepositoryPath(wanted: string, candidates: string[]): string | undefined {
+function repositoryPathCandidates(wanted: string, candidates: string[]): string[] {
     const caseInsensitive = process.platform === 'win32';
     const comparableWanted = caseInsensitive ? wanted.toLowerCase() : wanted;
     const wantedBase = path.posix.basename(comparableWanted);
@@ -341,9 +389,6 @@ function bestRepositoryPath(wanted: string, candidates: string[]): string | unde
         const comparableCandidate = caseInsensitive ? candidate.toLowerCase() : candidate;
         return path.posix.basename(comparableCandidate) === wantedBase;
     });
-    if (sameName.length === 0) {
-        return undefined;
-    }
 
     return sameName
         .map(candidate => {
@@ -364,7 +409,8 @@ function bestRepositoryPath(wanted: string, candidates: string[]): string | unde
             left.depthDifference - right.depthDifference ||
             left.depth - right.depth ||
             left.candidate.localeCompare(right.candidate)
-        )[0].candidate;
+        )
+        .map(item => item.candidate);
 }
 
 function rewriteMarkerLine(
@@ -436,9 +482,10 @@ function rewriteSectionPath(section: string, oldPath: string, newPath: string): 
         .join('');
 }
 
-async function resolveMissingPatchPaths(patch: string, repoRoot: string): Promise<string> {
+async function resolveMissingPatchPaths(patch: string, repoRoot: string): Promise<ResolvedPatch> {
     const sections = patch.split(/(?=^diff --git )/m);
     const missing: MissingPatchPath[] = [];
+    const verdicts: CandidateVerdict[] = [];
 
     for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex += 1) {
         const oldPath = markerPath(sections[sectionIndex], '--- ');
@@ -454,21 +501,75 @@ async function resolveMissingPatchPaths(patch: string, repoRoot: string): Promis
         }
     }
 
-    // The repository scan is deliberately skipped for the normal exact-path case.
     if (missing.length === 0) {
-        return patch;
+        return { patch, verdicts };
     }
 
     const files = await repositoryFiles(repoRoot);
+    const editorContents = dirtyEditorContents(repoRoot);
     for (const item of missing) {
-        const replacement = bestRepositoryPath(item.path, files);
-        if (!replacement) {
+        const candidates = repositoryPathCandidates(item.path, files);
+        if (candidates.length === 0) {
+            verdicts.push({
+                status: 'rejected',
+                filePath: path.join(repoRoot, item.path),
+                reason: 'file not found'
+            });
+            throw new PatchReportError(verdicts);
+        }
+
+        const accepted: string[] = [];
+        const candidateVerdicts: CandidateVerdict[] = [];
+        for (const candidate of candidates) {
+            const rewrittenSection = rewriteSectionPath(sections[item.sectionIndex], item.path, candidate);
+            try {
+                await preparePatch(
+                    rewrittenSection,
+                    repoRoot,
+                    configuration().whitespaceMatching,
+                    editorContents
+                );
+                accepted.push(candidate);
+                candidateVerdicts.push({
+                    status: 'accepted',
+                    filePath: path.join(repoRoot, candidate)
+                });
+            } catch (error) {
+                candidateVerdicts.push(await rejectedVerdictForPatch(
+                    error,
+                    rewrittenSection,
+                    repoRoot,
+                    editorContents
+                ));
+            }
+        }
+
+        if (accepted.length === 1) {
+            sections[item.sectionIndex] = rewriteSectionPath(
+                sections[item.sectionIndex],
+                item.path,
+                accepted[0]
+            );
+            verdicts.push(...candidateVerdicts);
             continue;
         }
-        sections[item.sectionIndex] = rewriteSectionPath(sections[item.sectionIndex], item.path, replacement);
-        output?.appendLine(`Resolved missing patch path ${item.path} -> ${replacement}`);
+
+        if (accepted.length > 1) {
+            const matchingFiles = accepted.map(candidate => path.join(repoRoot, candidate));
+            const acceptedKeys = new Set(matchingFiles.map(comparableFilePath));
+            const reason = `multiple files match: ${matchingFiles.join(' | ')}`;
+            verdicts.push(...candidateVerdicts.map(verdict =>
+                verdict.status === 'accepted' && acceptedKeys.has(comparableFilePath(verdict.filePath))
+                    ? { ...verdict, status: 'rejected' as const, reason }
+                    : verdict
+            ));
+        } else {
+            verdicts.push(...candidateVerdicts);
+        }
+        throw new PatchReportError(verdicts);
     }
-    return sections.join('');
+
+    return { patch: sections.join(''), verdicts };
 }
 
 function safeCopiedFileName(original: string, relativePath: string, hasComment: boolean): string {
@@ -579,14 +680,37 @@ function dirtyDocumentsForPrepared(prepared: PreparedPatch): vscode.TextDocument
     );
 }
 
-async function prepareAgainstCurrentEditors(patch: string, repoRoot: string): Promise<PreparedPatch> {
-    const resolvedPatch = await resolveMissingPatchPaths(normalizeLineEndings(patch), repoRoot);
-    return preparePatch(
-        resolvedPatch,
-        repoRoot,
-        configuration().whitespaceMatching,
-        dirtyEditorContents(repoRoot)
-    );
+async function prepareAgainstCurrentEditors(
+    patch: string,
+    repoRoot: string
+): Promise<{ prepared: PreparedPatch; verdicts: CandidateVerdict[] }> {
+    const editorContents = dirtyEditorContents(repoRoot);
+    const resolved = await resolveMissingPatchPaths(normalizeLineEndings(patch), repoRoot);
+    try {
+        const prepared = await preparePatch(
+            resolved.patch,
+            repoRoot,
+            configuration().whitespaceMatching,
+            editorContents
+        );
+        const known = new Set(resolved.verdicts.map(verdict => comparableFilePath(verdict.filePath)));
+        const verdicts = [...resolved.verdicts];
+        for (const file of prepared.files) {
+            const filePath = path.join(repoRoot, file.path);
+            if (!known.has(comparableFilePath(filePath))) {
+                verdicts.push({ status: 'accepted', filePath });
+            }
+        }
+        return { prepared, verdicts };
+    } catch (error) {
+        if (error instanceof PatchReportError) {
+            throw error;
+        }
+        throw new PatchReportError([
+            ...resolved.verdicts,
+            await rejectedVerdictForPatch(error, resolved.patch, repoRoot, editorContents)
+        ]);
+    }
 }
 
 function editorTextForPath(contents: Map<string, string> | undefined, relativePath: string): string | undefined {
@@ -605,13 +729,16 @@ async function firstPatchMismatch(
     patch: string,
     repoRoot: string,
     editorContents?: Map<string, string>
-): Promise<string | undefined> {
+): Promise<PatchMismatch | undefined> {
     for (const section of patch.split(/(?=^diff --git )/m)) {
         const oldPath = markerPath(section, '--- ');
         const newPath = markerPath(section, '+++ ');
         if (!oldPath) {
             if (newPath && await fileExists(path.join(repoRoot, newPath))) {
-                return `Expected file: ${newPath} <not to exist>\nFound: <file already exists>`;
+                return {
+                    filePath: newPath,
+                    reason: 'file already exists'
+                };
             }
             continue;
         }
@@ -622,7 +749,10 @@ async function firstPatchMismatch(
                 currentText = await fs.readFile(path.join(repoRoot, oldPath), 'utf8');
             } catch (error) {
                 if (isMissingFileError(error)) {
-                    return `Expected file: ${oldPath}\nFound: <file does not exist>`;
+                    return {
+                        filePath: oldPath,
+                        reason: 'file not found'
+                    };
                 }
                 continue;
             }
@@ -659,11 +789,14 @@ async function firstPatchMismatch(
                 const found = currentLines[declaredStart + offset];
                 if (found !== expected[offset]) {
                     const lineNumber = oldStart + offset;
-                    return [
-                        `Patch mismatch in ${oldPath} at ${hunkHeader}:`,
-                        `Expected ${oldPath}:${lineNumber}: ${JSON.stringify(expected[offset])}`,
-                        `Found    ${oldPath}:${lineNumber}: ${found === undefined ? '<EOF>' : JSON.stringify(found)}`
-                    ].join('\n');
+                    return {
+                        filePath: oldPath,
+                        reason: `${hunkHeader} does not match`,
+                        details: [
+                            `expected ${lineNumber}: ${JSON.stringify(expected[offset])}`,
+                            `found    ${lineNumber}: ${found === undefined ? '<EOF>' : JSON.stringify(found)}`
+                        ]
+                    };
                 }
             }
         }
@@ -671,20 +804,73 @@ async function firstPatchMismatch(
     return undefined;
 }
 
-async function logPatchFailure(
-    label: string,
+function firstPatchFile(patch: string): string | undefined {
+    for (const section of patch.split(/(?=^diff --git )/m)) {
+        const target = markerPath(section, '--- ') ?? markerPath(section, '+++ ');
+        if (target) {
+            return target;
+        }
+    }
+    return undefined;
+}
+
+function patchErrorFile(error: unknown): string | undefined {
+    const message = error instanceof Error ? error.message : String(error);
+    return /^(.+?):\s+hunk\s+\d+\b/.exec(message)?.[1];
+}
+
+function displayFilePath(repoRoot: string, filePath: string): string {
+    return path.isAbsolute(filePath) || path.win32.isAbsolute(filePath)
+        ? filePath
+        : path.join(repoRoot, filePath);
+}
+
+async function rejectedVerdictForPatch(
     error: unknown,
     patch: string,
     repoRoot: string,
     editorContents?: Map<string, string>
-): Promise<void> {
-    let mismatch: string | undefined;
+): Promise<CandidateVerdict> {
     try {
-        mismatch = await firstPatchMismatch(patch, repoRoot, editorContents);
-    } catch (diagnosticError) {
-        mismatch = `Could not inspect expected vs found text: ${fullError(diagnosticError)}`;
+        const mismatch = await firstPatchMismatch(patch, repoRoot, editorContents);
+        if (mismatch) {
+            return {
+                status: 'rejected',
+                filePath: displayFilePath(repoRoot, mismatch.filePath),
+                reason: mismatch.reason,
+                details: mismatch.details
+            };
+        }
+    } catch {
+        // The original patch error is still the most useful fallback.
     }
-    logDiagnostic(`${label}:\n${fullError(error)}${mismatch ? `\n\n${mismatch}` : ''}`);
+
+    const target = patchErrorFile(error) ?? firstPatchFile(patch);
+    return {
+        status: 'rejected',
+        filePath: target ? displayFilePath(repoRoot, target) : repoRoot,
+        reason: compactError(error)
+    };
+}
+
+function formatCandidateReport(verdicts: CandidateVerdict[]): string {
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const verdict of verdicts) {
+        const details = verdict.details ?? [];
+        const key = [verdict.status, comparableFilePath(verdict.filePath), verdict.reason ?? '', ...details].join('\0');
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        const accepted = verdict.status === 'accepted';
+        lines.push(
+            `${accepted ? 'INFO  🟢 ACCEPTED' : 'ERROR 🔴 REJECTED'} ${verdict.filePath}` +
+            (verdict.reason ? ` — ${verdict.reason}` : '')
+        );
+        lines.push(...details.map(detail => `      ${detail}`));
+    }
+    return lines.join('\n');
 }
 
 async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ignored'> {
@@ -693,9 +879,6 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
     if (dirtyDocuments.length === 0) {
         await checkPreparedPatch(prepared, config.stageChanges);
     }
-
-    const summary = summarizeFiles(prepared.files);
-    output?.appendLine(`\nPatch detected for ${prepared.repoRoot}:\n${summary}\n`);
 
     if (config.confirmBeforeApply) {
         updateStatus(true, true);
@@ -712,7 +895,6 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
         );
         updateStatus(true, false);
         if (choice !== 'Apply') {
-            output?.appendLine('Patch ignored.');
             return 'ignored';
         }
     }
@@ -738,7 +920,6 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
     await vscode.window.showInformationMessage(
         `${verb} ${finalPrepared.hunkCount} hunk${finalPrepared.hunkCount === 1 ? '' : 's'} in ${finalPrepared.files.length} file${finalPrepared.files.length === 1 ? '' : 's'}.`
     );
-    output?.appendLine(`${verb} patch successfully.`);
     return 'applied';
 }
 
@@ -801,6 +982,12 @@ interface PatchCandidate {
     prepared: PreparedPatch;
     exactPathMatch: boolean;
     exactPathCount: number;
+    verdicts: CandidateVerdict[];
+}
+
+interface PatchCandidateSearch {
+    candidate?: PatchCandidate;
+    report: string;
 }
 
 async function exactPatchPathCoverage(patch: string, repoRoot: string): Promise<{ exact: number; total: number }> {
@@ -820,35 +1007,66 @@ async function exactPatchPathCoverage(patch: string, repoRoot: string): Promise<
     return { exact, total };
 }
 
-async function bestPatchCandidateInWindow(patch: string): Promise<PatchCandidate | undefined> {
+async function bestPatchCandidateInWindow(patch: string): Promise<PatchCandidateSearch> {
     const roots = await repositoryRootsInWindow();
     const candidates: PatchCandidate[] = [];
+    const rejected: CandidateVerdict[] = [];
     for (const repoRoot of roots) {
         const coverage = await exactPatchPathCoverage(patch, repoRoot);
         try {
-            const prepared = await prepareAgainstCurrentEditors(patch, repoRoot);
+            const result = await prepareAgainstCurrentEditors(patch, repoRoot);
             candidates.push({
                 repoRoot,
-                prepared,
+                prepared: result.prepared,
                 exactPathMatch: coverage.total > 0 && coverage.exact === coverage.total,
-                exactPathCount: coverage.exact
+                exactPathCount: coverage.exact,
+                verdicts: result.verdicts
             });
         } catch (error) {
-            await logPatchFailure(
-                `Patch does not match ${repoRoot}`,
-                error,
-                patch,
-                repoRoot,
-                dirtyEditorContents(repoRoot)
-            );
+            if (error instanceof PatchReportError) {
+                rejected.push(...error.verdicts);
+            } else {
+                rejected.push(await rejectedVerdictForPatch(
+                    error,
+                    patch,
+                    repoRoot,
+                    dirtyEditorContents(repoRoot)
+                ));
+            }
         }
     }
 
-    return candidates.sort((left, right) =>
+    candidates.sort((left, right) =>
         Number(right.exactPathMatch) - Number(left.exactPathMatch) ||
         right.exactPathCount - left.exactPathCount ||
         left.repoRoot.localeCompare(right.repoRoot)
-    )[0];
+    );
+
+    if (candidates.length === 0) {
+        if (roots.length === 0) {
+            rejected.push({ status: 'rejected', filePath: '(no open Git repository)', reason: 'repository not found' });
+        }
+        return { report: formatCandidateReport(rejected) };
+    }
+
+    if (candidates.length > 1) {
+        const rootsList = candidates.map(candidate => candidate.repoRoot).join(' | ');
+        const verdicts = [
+            ...rejected,
+            ...candidates.flatMap(candidate => candidate.verdicts.map(verdict =>
+                verdict.status === 'accepted'
+                    ? { ...verdict, status: 'rejected' as const, reason: `multiple repositories match: ${rootsList}` }
+                    : verdict
+            ))
+        ];
+        return { report: formatCandidateReport(verdicts) };
+    }
+
+    const candidate = candidates[0];
+    return {
+        candidate,
+        report: formatCandidateReport(candidate.verdicts)
+    };
 }
 
 function isAlreadyExistsError(error: unknown): boolean {
@@ -928,7 +1146,6 @@ class PatchDispatchBus implements vscode.Disposable {
 
         try {
             await fs.writeFile(dispatchPath, JSON.stringify(dispatch), { encoding: 'utf8', flag: 'wx' });
-            logDiagnostic(`Detected and broadcast patch from ${source} to all VS Code windows (${id.slice(0, 10)}).`);
             vscode.window.setStatusBarMessage(`$(diff) Automato detected a patch from ${source}`, 5000);
         } catch (error) {
             if (!isAlreadyExistsError(error)) {
@@ -942,13 +1159,8 @@ class PatchDispatchBus implements vscode.Disposable {
                     // attempt was ignored or left a stale claim behind.
                     await this.removeDispatchFiles(id);
                     await fs.writeFile(dispatchPath, JSON.stringify(dispatch), { encoding: 'utf8', flag: 'wx' });
-                    logDiagnostic(`Re-broadcast repeated patch from ${source} (${id.slice(0, 10)}).`);
                     vscode.window.setStatusBarMessage(`$(diff) Automato re-detected a patch from ${source}`, 5000);
                 } else {
-                    logDiagnostic(
-                        `Patch from ${source} was detected in this window; the same patch was already broadcast ` +
-                        `${Math.round(ageMs)} ms ago (${id.slice(0, 10)}).`
-                    );
                     vscode.window.setStatusBarMessage(`$(diff) Automato detected an already-routed patch`, 5000);
                 }
             } catch (retryError) {
@@ -1035,7 +1247,8 @@ class PatchDispatchBus implements vscode.Disposable {
             return;
         }
 
-        const candidate = await bestPatchCandidateInWindow(dispatch.patch);
+        const search = await bestPatchCandidateInWindow(dispatch.patch);
+        const candidate = search.candidate;
         if (!candidate) {
             // Give exact and fuzzy matches in every other VS Code window time to claim
             // the dispatch before reporting a failure in the window the user focuses.
@@ -1056,20 +1269,16 @@ class PatchDispatchBus implements vscode.Disposable {
             }
 
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
-            const roots = await repositoryRootsInWindow();
-            logDiagnostic(
-                `Patch ${dispatch.id.slice(0, 10)} from ${dispatch.source} was detected, ` +
-                `but no Git repository in this window could prepare it. Open Git roots: ` +
-                `${roots.length > 0 ? roots.join(' | ') : '(none)'}. See the preceding per-repository errors.`
-            );
-            revealDiagnostics();
-            const choice = await vscode.window.showErrorMessage(
-                `Automato detected the patch from ${dispatch.source}, but it does not match any open Git repository in this window.`,
-                'Show Diagnostics'
-            );
-            if (choice === 'Show Diagnostics') {
-                revealDiagnostics();
-            }
+            const report = publishDiagnostics(search.report || 'ERROR 🔴 REJECTED patch — no matching file');
+            await queuePatchNotification(async () => {
+                const choice = await vscode.window.showErrorMessage(
+                    'Automato rejected the patch.',
+                    'Copy Diagnostics'
+                );
+                if (choice === 'Copy Diagnostics') {
+                    await copyDiagnostics(report);
+                }
+            });
             return;
         }
 
@@ -1095,25 +1304,28 @@ class PatchDispatchBus implements vscode.Disposable {
         }
 
         try {
-            output?.appendLine(
-                `This window claimed ${dispatch.id.slice(0, 10)} for ${candidate.repoRoot}` +
-                (candidate.exactPathMatch ? ' (exact paths).' : ' (fuzzy path repair).')
-            );
-            const result = await promptAndApply(candidate.prepared);
+            publishDiagnostics(search.report);
+            await queuePatchNotification(() => promptAndApply(candidate.prepared));
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
-            logDiagnostic(`Patch ${dispatch.id.slice(0, 10)} was ${result}. Clearing its dispatch so it can be copied again.`);
             await this.removeDispatchFiles(dispatch.id);
         } catch (error) {
             await fs.rm(this.claimPath(dispatch.id), { force: true });
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
-            await logPatchFailure(
-                'Claimed patch failed',
+            const rejection = await rejectedVerdictForPatch(
                 error,
                 candidate.prepared.sourceText,
                 candidate.repoRoot
             );
-            revealDiagnostics();
-            await vscode.window.showErrorMessage(`Automato refused the copied patch: ${compactError(error)}`);
+            const report = publishDiagnostics(formatCandidateReport([rejection]));
+            await queuePatchNotification(async () => {
+                const choice = await vscode.window.showErrorMessage(
+                    `Automato rejected the patch: ${rejection.reason ?? 'unknown reason'}`,
+                    'Copy Diagnostics'
+                );
+                if (choice === 'Copy Diagnostics') {
+                    await copyDiagnostics(report);
+                }
+            });
         }
     }
 
@@ -1311,9 +1523,6 @@ class DownloadsPatchWatcher implements vscode.Disposable {
             }
         }
         this.periodicTimer = setInterval(() => this.scheduleScan(0), 1500);
-        logDiagnostic(
-            `Watching Downloads for .patch, .diff, and .txt patches: ${this.directories.join(' | ')}`
-        );
     }
 
     public stop(): void {
@@ -1384,9 +1593,9 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                   `among ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'}.`
                 : `Scanned ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}: ` +
                   `none of ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'} contained a Git-style patch.`;
-            await vscode.window.showInformationMessage(message, 'Show Diagnostics').then(choice => {
-                if (choice === 'Show Diagnostics') {
-                    revealDiagnostics();
+            await vscode.window.showInformationMessage(message, 'Copy Diagnostics').then(choice => {
+                if (choice === 'Copy Diagnostics') {
+                    void copyDiagnostics();
                 }
             });
         }
@@ -1457,10 +1666,6 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                             continue;
                         }
 
-                        logDiagnostic(
-                            `${forcePublish ? 'Manually inspecting' : 'Downloads detected'} ${filePath} ` +
-                            `(${stats.size} bytes, modified ${new Date(stats.mtimeMs).toLocaleString()}).`
-                        );
                         if (await this.publishFile(filePath, freshGeneration)) {
                             summary.validPatches += 1;
                         }
@@ -1479,11 +1684,6 @@ class DownloadsPatchWatcher implements vscode.Disposable {
             }
             await this.persistKnownFiles();
             if (initial) {
-                logDiagnostic(
-                    `Downloads initial scan found ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'} ` +
-                    `across ${summary.directories} folder${summary.directories === 1 ? '' : 's'}. ` +
-                    'Files new or changed since the previous scan were inspected immediately.'
-                );
             }
             this.initialized = true;
         } catch (error) {
@@ -1520,7 +1720,6 @@ class DownloadsPatchWatcher implements vscode.Disposable {
                     logDiagnostic(`Downloads file ${filePath} was read, but it contained no Git-style unified diff.`);
                     return false;
                 }
-                logDiagnostic(`Valid patch extracted from ${filePath}; broadcasting it to every VS Code window.`);
                 await this.bus.publish(patch, filePath, freshGeneration);
                 return true;
             } catch (error) {
@@ -1683,9 +1882,7 @@ class ClipboardWatcher implements vscode.Disposable {
             if (error instanceof ClipboardReadError) {
                 output?.appendLine(error.message);
             } else {
-                output?.appendLine(
-                    `Clipboard inspection failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`
-                );
+                logDiagnostic(`Clipboard inspection failed: ${compactError(error)}`);
                 await vscode.window.showErrorMessage(`Automato could not inspect the clipboard: ${compactError(error)}`);
             }
         } finally {
@@ -1722,23 +1919,23 @@ async function runCommand(action: () => Promise<void>): Promise<void> {
     try {
         await action();
     } catch (error) {
-        logDiagnostic(error instanceof Error ? error.stack ?? error.message : String(error));
-        revealDiagnostics();
         const prefix = error instanceof PatchError ? 'Patch refused' : 'Automato';
-        await vscode.window.showErrorMessage(`${prefix}: ${compactError(error)}`);
+        const report = publishDiagnostics(`ERROR 🔴 REJECTED ${prefix} — ${compactError(error)}`);
+        const choice = await vscode.window.showErrorMessage(
+            `${prefix}: ${compactError(error)}`,
+            'Copy Diagnostics'
+        );
+        if (choice === 'Copy Diagnostics') {
+            await copyDiagnostics(report);
+        }
     }
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    output = vscode.window.createOutputChannel(OUTPUT_NAME);
+    output = vscode.window.createOutputChannel(OUTPUT_NAME, 'log');
     statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 35);
     statusBar.command = 'automato.toggleWatcher';
     context.subscriptions.push(output, statusBar);
-    logDiagnostic(
-        `Automato ${String(context.extension.packageJSON.version ?? 'unknown')} activated in process ${process.pid}. ` +
-        `Workspace trusted=${vscode.workspace.isTrusted}.`
-    );
-
     dispatchBus = new PatchDispatchBus();
     watcher = new ClipboardWatcher(context, dispatchBus);
     downloadsWatcher = new DownloadsPatchWatcher(dispatchBus, context);
@@ -1753,7 +1950,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(
         vscode.commands.registerCommand('automato.copyActiveFile', () => runCommand(() => copyActiveFile(context))),
         vscode.commands.registerCommand('automato.rescanAll', () => runCommand(rescanAll)),
-        vscode.commands.registerCommand('automato.showDiagnostics', () => revealDiagnostics()),
+        vscode.commands.registerCommand('automato.showDiagnostics', () => copyDiagnostics()),
         vscode.commands.registerCommand('automato.toggleWatcher', () => runCommand(async () => {
             if (!watcher) {
                 return;

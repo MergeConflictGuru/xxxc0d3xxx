@@ -2,7 +2,7 @@
   "name": "automato",
   "displayName": "Automato",
   "description": "Copy the active file for AI as both a file and text, then safely detect, review, repair, and apply copied unified diffs.",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "publisher": "local",
   "license": "MIT",
   "engines": {
