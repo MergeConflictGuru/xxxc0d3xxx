@@ -86,12 +86,14 @@ async function copyDiagnostics(report = lastDiagnosticsReport): Promise<void> {
     await vscode.window.showInformationMessage('Patch diagnostics copied.');
 }
 
-let patchNotificationTail: Promise<void> = Promise.resolve();
+let patchPromptTail: Promise<void> = Promise.resolve();
+let pendingPatchPrompts = 0;
 
-async function queuePatchNotification<T>(action: () => Promise<T>): Promise<T> {
-    const previous = patchNotificationTail;
+async function queuePatchPrompt<T>(action: () => Promise<T>): Promise<T> {
+    pendingPatchPrompts += 1;
+    const previous = patchPromptTail;
     let release!: () => void;
-    patchNotificationTail = new Promise<void>(resolve => {
+    patchPromptTail = new Promise<void>(resolve => {
         release = resolve;
     });
 
@@ -99,8 +101,23 @@ async function queuePatchNotification<T>(action: () => Promise<T>): Promise<T> {
     try {
         return await action();
     } finally {
+        pendingPatchPrompts -= 1;
         release();
     }
+}
+
+function showPatchRejection(message: string, report: string): void {
+    // Diagnostics are already in Output. Never let an error notification hide or
+    // block an Apply/Ignore prompt; a later valid patch must always take priority.
+    if (pendingPatchPrompts > 0) {
+        return;
+    }
+    void vscode.window.showErrorMessage(message, 'Copy Diagnostics').then(choice => {
+        if (choice === 'Copy Diagnostics') {
+            return copyDiagnostics(report);
+        }
+        return undefined;
+    });
 }
 
 async function gitRootForDirectory(directory: string): Promise<string> {
@@ -1270,15 +1287,7 @@ class PatchDispatchBus implements vscode.Disposable {
 
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
             const report = publishDiagnostics(search.report || 'ERROR 🔴 REJECTED patch — no matching file');
-            await queuePatchNotification(async () => {
-                const choice = await vscode.window.showErrorMessage(
-                    'Automato rejected the patch.',
-                    'Copy Diagnostics'
-                );
-                if (choice === 'Copy Diagnostics') {
-                    await copyDiagnostics(report);
-                }
-            });
+            showPatchRejection('Automato rejected the patch.', report);
             return;
         }
 
@@ -1305,7 +1314,7 @@ class PatchDispatchBus implements vscode.Disposable {
 
         try {
             publishDiagnostics(search.report);
-            await queuePatchNotification(() => promptAndApply(candidate.prepared));
+            await queuePatchPrompt(() => promptAndApply(candidate.prepared));
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
             await this.removeDispatchFiles(dispatch.id);
         } catch (error) {
@@ -1317,15 +1326,10 @@ class PatchDispatchBus implements vscode.Disposable {
                 candidate.repoRoot
             );
             const report = publishDiagnostics(formatCandidateReport([rejection]));
-            await queuePatchNotification(async () => {
-                const choice = await vscode.window.showErrorMessage(
-                    `Automato rejected the patch: ${rejection.reason ?? 'unknown reason'}`,
-                    'Copy Diagnostics'
-                );
-                if (choice === 'Copy Diagnostics') {
-                    await copyDiagnostics(report);
-                }
-            });
+            showPatchRejection(
+                `Automato rejected the patch: ${rejection.reason ?? 'unknown reason'}`,
+                report
+            );
         }
     }
 

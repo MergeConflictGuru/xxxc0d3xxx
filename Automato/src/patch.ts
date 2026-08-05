@@ -23,12 +23,17 @@ interface Hunk {
     bodyStart: number;
     bodyEnd: number;
     suffix: string;
+    declaredOldStart?: number;
     oldLines: string[];
+    newLines: string[];
     oldCount: number;
     newCount: number;
     matchIndex: number;
     actualOldLines?: string[];
     ignoredBodyIndexes: number[];
+    syntheticPathBodyIndex?: number;
+    syntheticPathOldOrdinal?: number;
+    syntheticPathNewOrdinal?: number;
 }
 
 export interface FilePatch {
@@ -54,6 +59,14 @@ export interface PreparedPatch {
     usedEditorBuffers: string[];
 }
 
+interface LocatedHunk {
+    index: number;
+    actualOldLines: string[];
+    oldLines: string[];
+    newLines: string[];
+    ignoredBodyIndexes: number[];
+}
+
 interface PathMatchScore {
     overlap: number;
     extra: number;
@@ -63,7 +76,7 @@ interface PathMatchScore {
 interface LocatedCandidate {
     path: string;
     mode: MatchMode;
-    matches: Array<{ index: number; actualOldLines: string[] }>;
+    matches: LocatedHunk[];
     usedEditorBuffer: boolean;
     lineEnding?: LineEnding;
     pathScore: PathMatchScore;
@@ -232,24 +245,26 @@ function encodeGitPath(relativePath: string, prefix: 'a/' | 'b/' | ''): string {
     return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\t/g, '\\t')}"`;
 }
 
-function parseHunkHeader(line: string, lineNumber: number): string {
-    const full = /^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(.*?)(?:\n)?$/.exec(line);
+function parseHunkHeader(line: string, lineNumber: number): { suffix: string; oldStart?: number } {
+    const full = /^@@\s+-(\d+)(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(.*?)(?:\n)?$/.exec(line);
     if (full) {
-        return full[1];
+        return { suffix: full[2], oldStart: Number.parseInt(full[1], 10) };
     }
     const trimmed = line.trimEnd();
     if (trimmed === '@@' || trimmed === '@@ @@') {
-        return '';
+        return { suffix: '' };
     }
     throw new PatchError(`Malformed hunk header at patch line ${lineNumber}: ${trimmed}`);
 }
 
 function parseOldSide(body: string[], patchLine: number, allowEmptyOldSide: boolean): {
     oldLines: string[];
+    newLines: string[];
     oldCount: number;
     newCount: number;
 } {
     const oldLines: string[] = [];
+    const newLines: string[] = [];
     let oldCount = 0;
     let newCount = 0;
     let previousPrefix: string | undefined;
@@ -263,12 +278,14 @@ function parseOldSide(body: string[], patchLine: number, allowEmptyOldSide: bool
         const prefix = line[0];
         if (prefix === ' ') {
             oldLines.push(line.slice(1));
+            newLines.push(line.slice(1));
             oldCount += 1;
             newCount += 1;
         } else if (prefix === '-') {
             oldLines.push(line.slice(1));
             oldCount += 1;
         } else if (prefix === '+') {
+            newLines.push(line.slice(1));
             newCount += 1;
         } else if (prefix === '\\') {
             if (!line.startsWith('\\ No newline at end of file')) {
@@ -276,6 +293,9 @@ function parseOldSide(body: string[], patchLine: number, allowEmptyOldSide: bool
             }
             if ((previousPrefix === ' ' || previousPrefix === '-') && oldLines.length > 0) {
                 oldLines[oldLines.length - 1] = oldLines[oldLines.length - 1].replace(/\n$/, '');
+            }
+            if ((previousPrefix === ' ' || previousPrefix === '+') && newLines.length > 0) {
+                newLines[newLines.length - 1] = newLines[newLines.length - 1].replace(/\n$/, '');
             }
             previousPrefix = prefix;
             continue;
@@ -293,7 +313,7 @@ function parseOldSide(body: string[], patchLine: number, allowEmptyOldSide: bool
             'Automato cannot safely locate a context-free insertion in an existing file.'
         );
     }
-    return { oldLines, oldCount, newCount };
+    return { oldLines, newLines, oldCount, newCount };
 }
 
 function removeEmailTrailer(text: string): string {
@@ -451,14 +471,16 @@ export function parseGitPatch(patchText: string): { lines: string[]; files: File
             const headerIndex = headerIndexes[hunkIndex];
             const bodyStart = headerIndex + 1;
             const bodyEnd = hunkIndex + 1 < headerIndexes.length ? headerIndexes[hunkIndex + 1] : end;
-            const suffix = parseHunkHeader(lines[headerIndex], headerIndex + 1);
+            const header = parseHunkHeader(lines[headerIndex], headerIndex + 1);
             const parsed = parseOldSide(lines.slice(bodyStart, bodyEnd), bodyStart + 1, kind === 'add');
             hunks.push({
                 headerIndex,
                 bodyStart,
                 bodyEnd,
-                suffix,
+                suffix: header.suffix,
+                declaredOldStart: header.oldStart,
                 oldLines: parsed.oldLines,
+                newLines: parsed.newLines,
                 oldCount: parsed.oldCount,
                 newCount: parsed.newCount,
                 matchIndex: -1,
@@ -466,21 +488,20 @@ export function parseGitPatch(patchText: string): { lines: string[]; files: File
             });
         }
 
-        // The copied AI context has one synthetic comment containing the repository-relative
-        // path. Models sometimes echo that line as unchanged diff context. It is metadata,
-        // not part of the real file, so discard the first such unchanged record.
+        // Preserve the full hunk first. Matching later tries it exactly as written before
+        // trying the AI-only synthetic path header removed.
         if (kind !== 'add' && hunks.length > 0) {
             const firstHunk = hunks[0];
             for (let bodyIndex = firstHunk.bodyStart; bodyIndex < firstHunk.bodyEnd; bodyIndex += 1) {
                 const record = lines[bodyIndex];
                 if (record.startsWith(' ') && /\bFILE PATH\s*:/i.test(record.slice(1))) {
-                    const oldOrdinal = lines
+                    firstHunk.syntheticPathBodyIndex = bodyIndex;
+                    firstHunk.syntheticPathOldOrdinal = lines
                         .slice(firstHunk.bodyStart, bodyIndex)
                         .filter(candidate => candidate.startsWith(' ') || candidate.startsWith('-')).length;
-                    firstHunk.oldLines.splice(oldOrdinal, 1);
-                    firstHunk.oldCount -= 1;
-                    firstHunk.newCount -= 1;
-                    firstHunk.ignoredBodyIndexes.push(bodyIndex);
+                    firstHunk.syntheticPathNewOrdinal = lines
+                        .slice(firstHunk.bodyStart, bodyIndex)
+                        .filter(candidate => candidate.startsWith(' ') || candidate.startsWith('+')).length;
                     break;
                 }
             }
@@ -645,36 +666,205 @@ function comparePathScores(left: PathMatchScore, right: PathMatchScore): number 
         left.suffix - right.suffix;
 }
 
-function locateHunksInText(filePatch: FilePatch, targetText: string, mode: MatchMode, displayPath: string):
-Array<{ index: number; actualOldLines: string[] }> {
-    const targetLines = splitLinesKeepEnds(normalizeNewlines(targetText));
-    const located: Array<{ index: number; actualOldLines: string[] }> = [];
+interface HunkVariant {
+    oldLines: string[];
+    newLines: string[];
+    ignoredBodyIndexes: number[];
+}
+
+function sameLines(left: string[], right: string[]): boolean {
+    return left.length === right.length && left.every((line, index) => line === right[index]);
+}
+
+function hunkVariant(hunk: Hunk, omitSyntheticPath: boolean): HunkVariant {
+    const oldLines = [...hunk.oldLines];
+    const newLines = [...hunk.newLines];
+    const ignoredBodyIndexes: number[] = [];
+    if (omitSyntheticPath &&
+        hunk.syntheticPathBodyIndex !== undefined &&
+        hunk.syntheticPathOldOrdinal !== undefined &&
+        hunk.syntheticPathNewOrdinal !== undefined) {
+        oldLines.splice(hunk.syntheticPathOldOrdinal, 1);
+        newLines.splice(hunk.syntheticPathNewOrdinal, 1);
+        ignoredBodyIndexes.push(hunk.syntheticPathBodyIndex);
+    }
+    return { oldLines, newLines, ignoredBodyIndexes };
+}
+
+function matchesAt(lines: string[], needle: string[], index: number, mode: MatchMode): boolean {
+    if (index < 0 || index + needle.length > lines.length) {
+        return false;
+    }
+    return needle.every((line, offset) =>
+        normalizeMatchLine(lines[index + offset], mode) === normalizeMatchLine(line, mode)
+    );
+}
+
+function validateLocatedOrder(located: LocatedHunk[], displayPath: string): void {
+    let previousEnd = -1;
+    for (let ordinal = 0; ordinal < located.length; ordinal += 1) {
+        const match = located[ordinal];
+        if (match.index < previousEnd) {
+            throw new PatchError(`${displayPath}: hunk ${ordinal + 1} overlaps or is out of order.`);
+        }
+        previousEnd = match.index + match.oldLines.length;
+    }
+}
+
+function locateAtDeclaredLines(
+    filePatch: FilePatch,
+    targetLines: string[],
+    withoutInsertedFirstLine: boolean
+): LocatedHunk[] | undefined {
+    const syntheticHunk = filePatch.hunks.findIndex(hunk => hunk.syntheticPathBodyIndex !== undefined);
+    let omitSyntheticPath = false;
+    if (withoutInsertedFirstLine && syntheticHunk >= 0) {
+        const header = filePatch.hunks[syntheticHunk];
+        const syntheticFileLine = header.declaredOldStart !== undefined &&
+            header.syntheticPathOldOrdinal !== undefined
+            ? header.declaredOldStart + header.syntheticPathOldOrdinal
+            : undefined;
+        if (syntheticHunk !== 0 || syntheticFileLine !== 1) {
+            return undefined;
+        }
+        omitSyntheticPath = true;
+    }
+
+    const located: LocatedHunk[] = [];
     let previousEnd = -1;
     for (let ordinal = 0; ordinal < filePatch.hunks.length; ordinal += 1) {
         const hunk = filePatch.hunks[ordinal];
-        const matches = findAllSubsequences(targetLines, hunk.oldLines, mode);
-        if (matches.length === 0) {
-            const qualifier = mode === 'indent' ? ' indentation-insensitive' : '';
-            throw new PatchError(`${displayPath}: hunk ${ordinal + 1} has no${qualifier} old-side match.`);
+        if (hunk.declaredOldStart === undefined || hunk.declaredOldStart <= 0) {
+            return undefined;
         }
-        if (matches.length > 1) {
-            const locations = matches.slice(0, 10).map(index => index + 1).join(', ');
-            throw new PatchError(
-                `${displayPath}: hunk ${ordinal + 1} matches ${matches.length} times ` +
-                `(lines ${locations}${matches.length > 10 ? ', …' : ''}); refusing to guess.`
-            );
-        }
-        const matchIndex = matches[0];
-        if (matchIndex < previousEnd) {
-            throw new PatchError(`${displayPath}: hunk ${ordinal + 1} overlaps or is out of order.`);
+        const variant = hunkVariant(hunk, omitSyntheticPath);
+        const insertedLineIsBeforeHunk = withoutInsertedFirstLine &&
+            (syntheticHunk < 0 || ordinal > syntheticHunk);
+        const matchIndex = hunk.declaredOldStart - 1 - (insertedLineIsBeforeHunk ? 1 : 0);
+        if (matchIndex < previousEnd || !matchesAt(targetLines, variant.oldLines, matchIndex, 'exact')) {
+            return undefined;
         }
         located.push({
             index: matchIndex,
-            actualOldLines: targetLines.slice(matchIndex, matchIndex + hunk.oldCount)
+            actualOldLines: targetLines.slice(matchIndex, matchIndex + variant.oldLines.length),
+            ...variant
         });
-        previousEnd = matchIndex + hunk.oldCount;
+        previousEnd = matchIndex + variant.oldLines.length;
     }
     return located;
+}
+
+function locateBySearch(
+    filePatch: FilePatch,
+    targetLines: string[],
+    mode: MatchMode,
+    displayPath: string,
+    omitSyntheticPath: boolean
+): LocatedHunk[] {
+    const variants = filePatch.hunks.map(hunk => hunkVariant(hunk, omitSyntheticPath));
+    const groups = new Map<string, number[]>();
+    for (let ordinal = 0; ordinal < variants.length; ordinal += 1) {
+        const key = JSON.stringify(variants[ordinal].oldLines.map(line => normalizeMatchLine(line, mode)));
+        const members = groups.get(key) ?? [];
+        members.push(ordinal);
+        groups.set(key, members);
+    }
+
+    const located: Array<LocatedHunk | undefined> = new Array(filePatch.hunks.length);
+    for (const ordinals of groups.values()) {
+        const firstOrdinal = ordinals[0];
+        const variant = variants[firstOrdinal];
+        const matches = findAllSubsequences(targetLines, variant.oldLines, mode);
+        if (matches.length === 0) {
+            const qualifier = mode === 'indent' ? ' indentation-insensitive' : '';
+            throw new PatchError(`${displayPath}: hunk ${firstOrdinal + 1} has no${qualifier} old-side match.`);
+        }
+
+        const replacements = ordinals.map(ordinal => variants[ordinal].newLines);
+        const replacementsAreIdentical = replacements.every(lines => sameLines(lines, replacements[0]));
+        if (!replacementsAreIdentical) {
+            const locations = matches.slice(0, 10).map(index => index + 1).join(', ');
+            throw new PatchError(
+                `${displayPath}: the same old chunk matches at lines ${locations}, ` +
+                'but its replacement text differs between hunks.'
+            );
+        }
+
+        if (ordinals.length !== matches.length) {
+            if (matches.length === 1 && ordinals.length === 1) {
+                // The ordinary unique-match case.
+            } else {
+                const locations = matches.slice(0, 10).map(index => index + 1).join(', ');
+                throw new PatchError(
+                    `${displayPath}: the same old chunk matches ${matches.length} times ` +
+                    `(lines ${locations}${matches.length > 10 ? ', …' : ''}), but the patch contains ` +
+                    `${ordinals.length} identical replacement hunk${ordinals.length === 1 ? '' : 's'}.`
+                );
+            }
+        }
+
+        for (let index = 1; index < matches.length; index += 1) {
+            if (matches[index] < matches[index - 1] + variant.oldLines.length) {
+                throw new PatchError(`${displayPath}: repeated matches overlap, so replacing all of them is unsafe.`);
+            }
+        }
+
+        for (let index = 0; index < ordinals.length; index += 1) {
+            const ordinal = ordinals[index];
+            const matchIndex = matches[index];
+            const ownVariant = variants[ordinal];
+            located[ordinal] = {
+                index: matchIndex,
+                actualOldLines: targetLines.slice(matchIndex, matchIndex + ownVariant.oldLines.length),
+                ...ownVariant
+            };
+        }
+    }
+
+    const complete = located.map((match, ordinal) => {
+        if (!match) {
+            throw new PatchError(`Internal error: hunk ${ordinal + 1} was not located.`);
+        }
+        return match;
+    });
+    validateLocatedOrder(complete, displayPath);
+    return complete;
+}
+
+function locateHunksInText(filePatch: FilePatch, targetText: string, mode: MatchMode, displayPath: string):
+LocatedHunk[] {
+    const targetLines = splitLinesKeepEnds(normalizeNewlines(targetText));
+
+    // 1. Exact old-side text at every line declared by the patch wins immediately.
+    const exact = locateAtDeclaredLines(filePatch, targetLines, false);
+    if (exact) {
+        return exact;
+    }
+
+    // 2. Retry as the same patch against the original file before Automato prepended
+    // its one-line AI path header. If the header is present in hunk context, omit it;
+    // otherwise every declared hunk position is simply one line too large.
+    const headerAdjusted = locateAtDeclaredLines(filePatch, targetLines, true);
+    if (headerAdjusted) {
+        return headerAdjusted;
+    }
+
+    // 3. Search by content. A repeated chunk is safe only when the patch contains one
+    // hunk per occurrence and every hunk has exactly the same replacement text.
+    let fullError: PatchError | undefined;
+    try {
+        return locateBySearch(filePatch, targetLines, mode, displayPath, false);
+    } catch (error) {
+        if (!(error instanceof PatchError)) {
+            throw error;
+        }
+        fullError = error;
+    }
+
+    if (filePatch.hunks.some(hunk => hunk.syntheticPathBodyIndex !== undefined)) {
+        return locateBySearch(filePatch, targetLines, mode, displayPath, true);
+    }
+    throw fullError;
 }
 
 async function candidateText(
@@ -798,8 +988,15 @@ async function locateFilePatch(
         filePatch.newPath = undefined;
     }
     for (let index = 0; index < filePatch.hunks.length; index += 1) {
-        filePatch.hunks[index].matchIndex = chosen.matches[index].index;
-        filePatch.hunks[index].actualOldLines = chosen.matches[index].actualOldLines;
+        const hunk = filePatch.hunks[index];
+        const match = chosen.matches[index];
+        hunk.matchIndex = match.index;
+        hunk.actualOldLines = match.actualOldLines;
+        hunk.oldLines = match.oldLines;
+        hunk.newLines = match.newLines;
+        hunk.oldCount = match.oldLines.length;
+        hunk.newCount = match.newLines.length;
+        hunk.ignoredBodyIndexes = match.ignoredBodyIndexes;
     }
     return chosen.usedEditorBuffer;
 }
