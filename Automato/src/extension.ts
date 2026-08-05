@@ -906,7 +906,7 @@ async function promptAndApply(prepared: PreparedPatch): Promise<'applied' | 'ign
         const remaining = prepared.files.length > 5 ? `  …and ${prepared.files.length - 5} more` : '';
         const choice = await vscode.window.showInformationMessage(
             `Automato found a valid patch (${prepared.hunkCount} hunk${prepared.hunkCount === 1 ? '' : 's'}): ${compactFiles}${remaining}`,
-            { modal: false },
+            { modal: true },
             'Apply',
             'Ignore'
         );
@@ -953,10 +953,11 @@ async function rescanAll(): Promise<void> {
         watcher.inspectNow(false, generation),
         downloadsWatcher.inspectNow(false, generation)
     ]);
-    await vscode.window.showInformationMessage(
-        `Rescanned clipboard and ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}; ` +
+    vscode.window.setStatusBarMessage(
+        `$(check) Automato rescanned clipboard and ${summary.directories} Downloads folder${summary.directories === 1 ? '' : 's'}; ` +
         `found ${summary.validPatches} downloaded patch${summary.validPatches === 1 ? '' : 'es'} ` +
-        `among ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'}.`
+        `among ${summary.candidates} candidate file${summary.candidates === 1 ? '' : 's'}.`,
+        7000
     );
 }
 
@@ -1288,6 +1289,7 @@ class PatchDispatchBus implements vscode.Disposable {
             this.seenGenerations.set(dispatch.id, dispatch.createdAt);
             const report = publishDiagnostics(search.report || 'ERROR 🔴 REJECTED patch — no matching file');
             showPatchRejection('Automato rejected the patch.', report);
+            await this.removeDispatchFiles(dispatch.id);
             return;
         }
 
@@ -1330,6 +1332,7 @@ class PatchDispatchBus implements vscode.Disposable {
                 `Automato rejected the patch: ${rejection.reason ?? 'unknown reason'}`,
                 report
             );
+            await this.removeDispatchFiles(dispatch.id);
         }
     }
 
