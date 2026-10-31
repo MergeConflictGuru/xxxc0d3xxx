@@ -1,0 +1,10 @@
+bin/
+obj/
+publish/
+release/
+data/
+*-audit.json
+test-results.txt
+*.invalid-copy.json
+Scroll.png
+

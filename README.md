@@ -1,5 +1,7 @@
 # Local VS Code extensions
 
+The standalone Windows tray app [CodexQuotaTray](CodexQuotaTray/README.md) displays per-account Codex quota and reset timelines, saves account logins, and switches the Codex desktop app between them.
+
 This repository contains four independently packaged VS Code extensions:
 
 - `Automato`

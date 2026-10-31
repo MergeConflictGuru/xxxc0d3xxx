@@ -4,3 +4,16 @@
 *.vsix
 dist/
 *.log
+*/bin/*
+*/obj/*
+.app_tmp
+.agemts_tmp
+*.pyc
+test_*.py
+test_*.?js
+**/release/
+*-audit.json
+*audit.json
+CodexQuotaTray/data/
+*-self-test.txt
+CodexQuotaTray/Scroll.png

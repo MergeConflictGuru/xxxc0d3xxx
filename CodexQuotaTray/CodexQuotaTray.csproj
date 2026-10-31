@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CodexQuotaTray</AssemblyName>
+    <ApplicationIcon>Scroll.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup><Compile Remove="InvisibleLauncher/**/*.cs" /><Compile Remove="src/ConversationAccounts/**/*.cs" /><EmbeddedResource Include="Scroll.ico" LogicalName="CodexQuotaTray.Scroll.ico" /></ItemGroup>
+</Project>
+
