@@ -1,0 +1,15 @@
+Seamless composer drops prototype
+
+1. Close the old desktop file bridge from its tray menu, if running.
+2. Start "Start desktop file bridge.lnk" as your normal Explorer user (Jakub).
+3. Restart ConversationAccounts to load the updated controller.
+4. Right-click the file bridge tray icon and enable "Seamless composer drops (experimental)".
+5. Drag a disposable file from Explorer onto the actual message editor. The file should appear as an attachment; nothing sends the message automatically.
+
+The helper stays hidden. A nearly transparent non-activating window receives cross-user drops over the message editor only after an Explorer drag-start event. Before intercepting, it compares the Windows SID of Explorer with the SID of Codex. Matching SIDs bypass the overlay and use Windows' native drag-and-drop path. It hides on cancellation, mouse release, expiry, minimization, occlusion, or disconnect. Turning off the tray toggle disables interception immediately. The helper must run in the same desktop session as Codex, under the Explorer user.
+
+Supported prototype scope: files from Explorer, dropped on the editor. Not folders, virtual email attachments, arbitrary text drags, the entire app window, or other Windows sessions. Applications must emit the Windows drag events; no event means no overlay. Multi-monitor/DPI placement and actual cross-user Explorer/OLE delivery still require real-device validation.
+
+A chat identity check prevents delivery if you change chats during the drag. Duplicate polling replies are acknowledged without reattaching. Uncertain delivery is never retried automatically. Copied attachments stay in desktop-file-bridge/dropped; failures preserve them and show a notification. Original files are unchanged. Do not delete staged files while chats still depend on them.
+
+Native checks passed: no foreground activation, hidden when idle, disabled cleanup, rejection of non-Explorer drag events, and event-hook installation. Three controller tests passed for duplicate handling, changed-chat rejection, and uncertain-dispatch handling. Actual cross-user drag remains unverified until the helper is launched as Jakub.
