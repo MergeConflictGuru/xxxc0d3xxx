@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System.Drawing.Drawing2D;
 
 namespace CodexQuotaTray;
@@ -150,6 +150,10 @@ sealed class TrayWindow : Form
         {
             if (!demo && grid.CurrentRow?.Tag is Account account) await RunAction(() => Switch(account));
         };
+        grid.ActivateCliRow += async () =>
+        {
+            if (!demo && grid.CurrentRow?.Tag is Account account) await SwitchToCli(account);
+        };
         grid.RemoveRow += () =>
         {
             if (!demo) _ = RunAction(() => { RemoveSelectedAccount(); return Task.CompletedTask; });
@@ -164,11 +168,7 @@ sealed class TrayWindow : Form
             if (e.Button == MouseButtons.Right)
             {
                 var account = (Account)row.Tag!;
-                await RunAction(async () =>
-                {
-                    await Switch(account, startDesktop: false);
-                    await LaunchCli();
-                });
+                await SwitchToCli(account);
             }
         };
         Controls.Add(grid); grid.BringToFront();
@@ -178,6 +178,8 @@ sealed class TrayWindow : Form
         menu.Items.Add("Save current login", null, async (_, _) => await RunAction(async () => { store.CaptureCurrent(readdRemoved: true); store.Save(); await RefreshAll(); }));
         menu.Items.Add("Restart Codex", null, async (_, _) => await RunAction(async () => { ++recoveryGeneration; await CodexProcess.Stop(store.Data); await CodexProcess.Start(store.Data); }));
         menu.Items.Add("Kill Codex", null, async (_, _) => await RunAction(async () => { ++recoveryGeneration; await CodexProcess.Stop(store.Data); status.Text = "Codex desktop stopped."; }));
+        menu.Items.Add("Alternate launch (Shift+click)", null, async (_, _) => await RunAction(LaunchAlternate));
+        menu.Items.Add("Configure alternate launch…", null, (_, _) => ConfigureAlternate());
         menu.Items.Add(new ToolStripSeparator());
         var hoursItem = new ToolStripMenuItem("6 hours") { Checked = true };
         var weekItem = new ToolStripMenuItem("8 days");
@@ -216,7 +218,12 @@ sealed class TrayWindow : Form
             }
         };
         tray = new NotifyIcon { Icon = trayIcon, Text = "Codex Quota Tray", Visible = true, ContextMenuStrip = menu };
-        tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) { if (Visible && WindowState != FormWindowState.Minimized && ContainsFocus) Hide(); else Reveal(); } };
+        tray.MouseClick += async (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if ((ModifierKeys & Keys.Shift) != 0) { if (!demo) await RunAction(LaunchAlternate); return; }
+            if (Visible && WindowState != FormWindowState.Minimized && ContainsFocus) Hide(); else Reveal();
+        };
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) Hide(); else AnchorPopup(); };
         DpiChanged += (_, _) => BeginInvoke(AnchorPopup);
         Deactivate += (_, _) => { if (!dialogOpen && !rendering && !menuOpen) Hide(); };
@@ -234,7 +241,7 @@ sealed class TrayWindow : Form
                 store.DiscoverBackups();
                 var active = store.CaptureCurrent();
                 current.Text = active?.Email ?? "";
-                store.Save(); DrawRows();
+                store.SaveCache(); DrawRows();
                 authPending = false; authDebounce.Stop();
             }
             catch (IOException) { }
@@ -325,7 +332,11 @@ sealed class TrayWindow : Form
             tray.ShowBalloonTip(6000, "Codex Quota Tray", status.Text, ToolTipIcon.Error);
             try { File.AppendAllText(Path.Combine(store.DirectoryPath, "operations.log"), $"{DateTimeOffset.Now:O} Action failed: {e.GetType().Name} (0x{e.HResult:X8})\n{e}\n"); } catch { }
         }
-        finally { busy = false; UseWaitCursor = false; DrawRows(); }
+        finally
+        {
+            if (store.CacheSaveError != null) status.Text += " | " + store.CacheSaveError;
+            busy = false; UseWaitCursor = false; DrawRows();
+        }
         if (queuedAction != null) { var next = queuedAction; queuedAction = null; await RunAction(next); }
     }
     async Task RefreshAll()
@@ -344,7 +355,7 @@ sealed class TrayWindow : Form
             status.Text = $"Reading quota for {account.Email}…";
             await service.Refresh(account, cancellation.Token); DrawRows();
         }
-        store.Save();
+        store.SaveCache();
         status.Text = $"Updated {DateTime.Now:t} • {store.Data.Accounts.Count} saved accounts • refreshes every 2 minutes";
         if (store.Data.Accounts.Any(a => a.Error != null)) status.Text += " • Some reads failed; hover rows for details";
         }
@@ -355,7 +366,7 @@ sealed class TrayWindow : Form
         var generation = ++recoveryGeneration;
         CodexProcess.ValidateLaunch(store.Data);
         store.RepairBackupPaths();
-        if (!File.Exists(target.Backup)) throw new InvalidOperationException($"No saved login for {target.Email}. Sign in to that account in Codex, then refresh to save it.");
+        if (!File.Exists(target.Backup)) throw new InvalidOperationException($"Could not find the saved login for {target.Email}. Checked {target.Backup}. Verify the Codex home folder in Settings.");
         if (Identity.Read(target.Backup).Key != target.Key) throw new InvalidOperationException("Saved login identity mismatch.");
         var selectedContents = File.ReadAllText(target.Backup);
         status.Text = $"Switching to {target.Email}…";
@@ -373,7 +384,7 @@ sealed class TrayWindow : Form
             Store.AtomicWrite(store.AuthPath, selectedContents);
             if (Identity.Read(store.AuthPath).Key != target.Key) throw new InvalidOperationException("Authentication replacement could not be verified.");
             foreach (var a in store.Data.Accounts) a.Active = a.Key == target.Key;
-            store.Save(); DrawRows();
+            store.SaveCache(); DrawRows();
             if (startDesktop)
             {
                 stage = "starting Codex";
@@ -389,15 +400,20 @@ sealed class TrayWindow : Form
             throw new InvalidOperationException($"Switch failed while {stage}; the previous auth.json was restored. {error.Message}", error);
         }
         foreach (var a in store.Data.Accounts) a.Active = a.Key == target.Key;
-        store.Save(); current.Text = $"Logged in: {target.Email}";
+        store.SaveCache(); current.Text = $"Logged in: {target.Email}";
         status.Text = startDesktop
             ? $"Switched to {target.Email}; Codex launch requested."
             : $"Switched to {target.Email}; ready to launch Codex CLI.";
         if (startDesktop && store.Data.ResumeRecentChatsAfterSwitch) _ = RecoverAfterRestart(generation);
     }
+    Task SwitchToCli(Account account) => RunAction(async () =>
+    {
+        await Switch(account, startDesktop: false);
+        await LaunchCli();
+    });
     Task LaunchCli()
     {
-        var command = DesktopCommand.Parse($"\"{store.Data.CliPath}\" {store.Data.CliArguments}");
+        var command = DesktopCommand.Parse(store.Data.CliCommand);
         if (string.IsNullOrWhiteSpace(command.Executable) || !File.Exists(command.Executable))
             throw new InvalidOperationException($"Codex CLI was not found at:\n{command.Executable}\nSet its path in Settings.");
         var info = new System.Diagnostics.ProcessStartInfo(command.Executable)
@@ -411,6 +427,24 @@ sealed class TrayWindow : Form
         info.Environment["CODEX_HOME"] = store.Data.CodexHome;
         using var process = System.Diagnostics.Process.Start(info) ?? throw new InvalidOperationException("Could not start Codex CLI.");
         status.Text = "Started Codex CLI for the active account: " + string.Join(" ", command.Arguments);
+        return Task.CompletedTask;
+    }
+    void ConfigureAlternate()
+    {
+        dialogOpen = true;
+        try { using var dialog = new AlternateLaunchDialog(store); dialog.ShowDialog(this); }
+        finally { dialogOpen = false; }
+    }
+    Task LaunchAlternate()
+    {
+        if (string.IsNullOrWhiteSpace(store.Data.AlternateLaunchCommand)) ConfigureAlternate();
+        if (string.IsNullOrWhiteSpace(store.Data.AlternateLaunchCommand)) return Task.CompletedTask;
+        var command = DesktopCommand.Parse(store.Data.AlternateLaunchCommand);
+        if (!File.Exists(command.Executable)) throw new InvalidOperationException("Alternate launch executable was not found. Use Configure alternate launch in the tray menu.");
+        var info = command.StartInfo();
+        info.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(command.Executable))!;
+        using var process = System.Diagnostics.Process.Start(info) ?? throw new InvalidOperationException("Could not start the alternate command.");
+        status.Text = "Alternate launch requested.";
         return Task.CompletedTask;
     }
     async Task RecoverAfterRestart(int generation)
@@ -710,6 +744,7 @@ sealed class SmoothGrid : DataGridView
 {
     public event Action<int>? NavigateRow;
     public event Action? ActivateRow;
+    public event Action? ActivateCliRow;
     public event Action? RemoveRow;
     public event Action? ToggleTimeline;
     public SmoothGrid() { DoubleBuffered = true; }
@@ -718,6 +753,7 @@ sealed class SmoothGrid : DataGridView
         if (keyData == Keys.Up) { NavigateRow?.Invoke(-1); return true; }
         if (keyData == Keys.Down) { NavigateRow?.Invoke(1); return true; }
         if (keyData == Keys.Enter) { ActivateRow?.Invoke(); return true; }
+        if (keyData == Keys.Apps || keyData == (Keys.Shift | Keys.F10)) { ActivateCliRow?.Invoke(); return true; }
         if (keyData == Keys.Delete) { RemoveRow?.Invoke(); return true; }
         if (keyData == Keys.Tab) { ToggleTimeline?.Invoke(); return true; }
         return base.ProcessCmdKey(ref msg, keyData);
@@ -736,27 +772,51 @@ sealed class PopupMenuColors : ProfessionalColorTable
     public override Color SeparatorLight => ToolStripDropDownBackground;
 }
 
+sealed class AlternateLaunchDialog : Form
+{
+    public AlternateLaunchDialog(Store store)
+    {
+        Text = "Alternate launch — Shift+click"; ClientSize = new Size(720, 205);
+        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent; Font = new Font("Segoe UI", 10);
+        Controls.Add(new Label { Text = "Executable and arguments (quote paths containing spaces)", AutoSize = true, Location = new Point(18, 18) });
+        var command = new TextBox { Text = store.Data.AlternateLaunchCommand, Location = new Point(18, 47), Width = 684 }; Controls.Add(command);
+        Controls.Add(new Label { Text = "Shift+left-click the tray icon to run this command. An empty command disables it.\nThis does not switch accounts or change the normal desktop or CLI launch settings.", AutoSize = true, Location = new Point(18, 85) });
+        var save = new Button { Text = "Save", Location = new Point(495, 155), Size = new Size(100, 30) };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(605, 155), Size = new Size(100, 30) };
+        Controls.Add(save); Controls.Add(cancel); AcceptButton = save; CancelButton = cancel;
+        save.Click += (_, _) =>
+        {
+            try
+            {
+                var value = command.Text.Trim();
+                if (value.Length > 0 && !File.Exists(DesktopCommand.Parse(value).Executable)) throw new InvalidOperationException("Executable not found. Quote the executable path before its arguments.");
+                store.Data.AlternateLaunchCommand = value; store.Save(); DialogResult = DialogResult.OK;
+            }
+            catch (Exception error) { MessageBox.Show(this, error.Message, "Alternate launch"); }
+        };
+    }
+}
+
 sealed class SettingsDialog : Form
 {
     public SettingsDialog(Store store)
     {
-        Text = "Codex Quota Tray settings"; Size = new Size(710, 440); FormBorderStyle = FormBorderStyle.FixedDialog;
+        Text = "Codex Quota Tray settings"; Size = new Size(710, 385); FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent; MaximizeBox = false; MinimizeBox = false;
         Font = new Font("Segoe UI", 10);
         var home = Field("Codex home", store.Data.CodexHome, 20, false);
         var desktop = Field("Codex desktop executable or launcher", store.Data.DesktopPath, 77, true);
-        var cli = Field("Codex CLI executable", store.Data.CliPath, 134, true);
-        var cliArguments = Field("CLI arguments after switching to the clicked account", store.Data.CliArguments, 191, false);
-        var startup = new CheckBox { Text = "Start in the tray when Windows starts", Checked = store.Data.StartWithWindows, AutoSize = true, Location = new Point(20, 248) }; Controls.Add(startup);
-        var recovery = new CheckBox { Text = "Continue recent interrupted and quota-stopped chats after switching accounts", Checked = store.Data.ResumeRecentChatsAfterSwitch, AutoSize = true, Location = new Point(20, 278) }; Controls.Add(recovery);
-        var note = new Label { Text = "Backups: auth.json.<email> in Codex home. These files contain login credentials.\nSettings: " + Path.Combine(store.DirectoryPath, "settings.json"), AutoSize = true, Location = new Point(20, 310) }; Controls.Add(note);
-        var save = new Button { Text = "Save", Location = new Point(570, 365), Size = new Size(100, 30) }; Controls.Add(save); AcceptButton = save;
+        var cli = Field("Codex CLI command (executable and arguments)", store.Data.CliCommand, 134, false);
+        var startup = new CheckBox { Text = "Start in the tray when Windows starts", Checked = store.Data.StartWithWindows, AutoSize = true, Location = new Point(20, 191) }; Controls.Add(startup);
+        var recovery = new CheckBox { Text = "Continue recent interrupted and quota-stopped chats after switching accounts", Checked = store.Data.ResumeRecentChatsAfterSwitch, AutoSize = true, Location = new Point(20, 221) }; Controls.Add(recovery);
+        var note = new Label { Text = "Backups: auth.json.<email> in Codex home. These files contain login credentials.\nSettings: " + Path.Combine(store.DirectoryPath, "settings.json"), AutoSize = true, Location = new Point(20, 253) }; Controls.Add(note);
+        var save = new Button { Text = "Save", Location = new Point(570, 308), Size = new Size(100, 30) }; Controls.Add(save); AcceptButton = save;
         save.Click += (_, _) =>
         {
             if (!Directory.Exists(home.Text)) { MessageBox.Show($"Codex home folder does not exist:\n{home.Text}"); return; }
             if (!File.Exists(DesktopCommand.Parse(desktop.Text).Executable)) { MessageBox.Show($"Codex desktop executable or launcher does not exist:\n{DesktopCommand.Parse(desktop.Text).Executable}\nQuote executable paths containing spaces before adding arguments."); return; }
-            if (!File.Exists(cli.Text.Trim())) { MessageBox.Show($"Codex CLI executable does not exist:\n{cli.Text}"); return; }
-            try { _ = DesktopCommand.Parse($"\"{cli.Text.Trim()}\" {cliArguments.Text}"); }
+            try { if (!File.Exists(DesktopCommand.Parse(cli.Text).Executable)) throw new InvalidOperationException("Executable not found. Quote paths containing spaces before adding arguments."); }
             catch (Exception error) { MessageBox.Show("Invalid Codex CLI command: " + error.Message); return; }
             try
             {
@@ -768,7 +828,7 @@ sealed class SettingsDialog : Form
                 if (!string.Equals(desktop.Text, store.Data.DesktopPath, StringComparison.OrdinalIgnoreCase)) store.Data.DesktopAppId = "";
                 var previousHome = store.Data.CodexHome;
                 store.Data.CodexHome = Path.GetFullPath(home.Text); store.Data.DesktopPath = desktop.Text.Trim();
-                store.Data.CliPath = Path.GetFullPath(cli.Text.Trim()); store.Data.CliArguments = cliArguments.Text.Trim();
+                store.Data.CliCommand = cli.Text.Trim();
                 // Switching Codex home starts a separate inventory; old backups stay where they were.
                 store.Data.Accounts = store.Data.Accounts.Where(a => string.Equals(Path.GetDirectoryName(a.Backup), store.Data.CodexHome, StringComparison.OrdinalIgnoreCase)).ToList();
                 if (!string.Equals(Path.GetFullPath(previousHome), store.Data.CodexHome, StringComparison.OrdinalIgnoreCase)) store.Data.RemovedAccountKeys.Clear();

@@ -1,4 +1,17 @@
-# Codex Quota Tray
+﻿# Codex Quota Tray
+
+Launch settings use a full command in one box: quote the executable path when it
+contains spaces, then append its arguments. Existing split `CliPath` and
+`CliArguments` settings migrate automatically to `CliCommand`, preserving nested
+quoted commands such as `runas`. The desktop launch command remains independent.
+
+Shift+left-click on the tray icon runs `AlternateLaunchCommand`; configure it from
+the tray menu's **Configure alternate launch…** item. If unconfigured, Shift-click
+opens that configuration dialog. The alternate command is generic: it does not
+switch accounts, stop Codex, or change the normal desktop or CLI launch commands.
+For example, a PowerShell command can run CodexWeb's `start.ps1` with
+`-RouterRoot <environment> -Background` to start/reuse the routed web server and
+open its UI. Use `-NoBrowser` when only the server should start.
 
 Native Windows app for saving Codex logins, reading each account's quota, and switching the desktop app from the system tray. Requires Windows and .NET 10 Desktop Runtime. Codex's bundled CLI and Microsoft Store desktop installation are detected automatically; custom installations can be selected in Settings.
 
@@ -15,11 +28,13 @@ For a portable folder using an installed .NET Desktop Runtime:
 dotnet publish CodexQuotaTray/CodexQuotaTray.csproj -c Release --no-self-contained -o CodexQuotaTray/publish
 ```
 
-To build and apply updates while the switcher is running, use `powershell -File CodexQuotaTray/update.ps1`. It builds in a separate staging folder, stops only this workspace's switcher instances, creates destination directories explicitly, updates all standard launch folders, and restarts the switcher through the Windows shell. It never restarts the Codex desktop.
+To build and apply updates while the switcher is running, use `powershell -File CodexQuotaTray/update.ps1`. It builds in a separate staging folder, stops only this workspace's switcher instances, creates the destination directory explicitly, updates the published launch folder and deletes other copies named `CodexQuotaTray.exe`, and restarts the switcher through the Windows shell. It never restarts the Codex desktop.
 
 Click the parchment-scroll tray icon to show a compact, borderless popup above the bottom-right taskbar area. The popup contains account rows and a timeline time scale, with no table labels or toolbar. Clicking away or pressing Escape hides it. The logged-in account has a rainbow gradient highlight. Middle-click the table to switch to the eight-day view. Select an account and press **Delete** to remove it from the tray and delete its saved backup; a persistent exclusion prevents discovery from adding it again. Removing the active login leaves the live `auth.json` in place. Use **Save current login** to explicitly add that login back. Right-click an account row to switch the saved login and run the configured Codex CLI command without relaunching the GUI. Right-click the tray icon for every other action. Use **Quit** to exit. Settings offers **Start with Windows**; startup opens in the tray. Launch with `--tray` for the same behavior.
 
 Ctrl+Shift+Q opens the popup if Windows allows the shortcut to be registered; an existing binding is never replaced. Its availability is listed beside **Show accounts** in the tray menu. Use Up/Down to select a row and Enter to switch to that account. Actions requested during refresh are queued and run after the current account read finishes. Tab toggles the six-hour and eight-day timelines.
+
+For keyboard-only CLI launch: press **Ctrl+Shift+Q**, choose an account with **Up/Down**, then press the **Menu/context-menu key** or **Shift+F10**. This performs the same action as right-clicking that account: switches its login and opens the configured CLI command. **Enter** switches and opens the desktop GUI; **Escape** closes the popup. **Win+Q** is Windows Search, not the tray shortcut.
 
 - **%5h / %wk**: percentage remaining, matched by 300-minute and 10,080-minute windows. Unknown values show a dash. Hover for the last successful read, stale status, and any error.
 - **#r**: available earned reset credits, as reported by Codex. The app only reads this count; it does not redeem resets.
@@ -45,11 +60,15 @@ Backups contain the same sensitive credentials as `auth.json`; keep the Codex ho
 Verification:
 
 ```powershell
-& .\CodexQuotaTray\bin\Release\net10.0-windows\CodexQuotaTray.exe --self-test
-Get-Content .\CodexQuotaTray\bin\Release\net10.0-windows\test-results.txt
-& .\CodexQuotaTray\bin\Release\net10.0-windows\CodexQuotaTray.exe --demo
+& .\CodexQuotaTray\publish\CodexQuotaTray.exe --self-test
+Get-Content .\CodexQuotaTray\publish\test-results.txt
+& .\CodexQuotaTray\publish\CodexQuotaTray.exe --demo
 ```
 
 Self-tests use fake credentials in a temporary directory and a fake JSON-RPC subprocess. Demo mode displays sample accounts and disables credential/process mutations. No live account switching is performed by tests.
 
-The desktop executable setting also accepts publish\InvisibleLauncher.exe. This launcher uses the saved aiaiai credentials when needed and runs the installed Codex package with Invoke-CommandInDesktopPackage. The tray resolves the installed ChatGPT.exe separately for stop/start tracking. Launcher failures are recorded beside the executable in InvisibleLauncher.error.log. Launcher source is in InvisibleLauncher/.
+The desktop executable setting accepts `publish\InvisibleLauncher.exe <WindowsUsername>`. With no `--exe`, it launches the normal installed Codex/ChatGPT application as that Windows user. `--exe <path>` explicitly selects another executable. InvisibleLauncher does not discover ConversationAccounts or start dictation. ConversationAccounts.exe owns its backend, configured web UI, and dictation startup. Console helpers stay hidden and GUI executables use a normal window. Launcher diagnostics are in `InvisibleLauncher.error.log` and `InvisibleLauncher.child.log`.
+
+Automatic settings and quota-cache saves are best effort: an unwritable shared `data` folder shows a status warning while account switching, quota reads, and launching continue. Authentication backup/write/identity failures still abort switching. Explicit Settings and account-removal saves still report failures. `update.ps1` keeps only `publish\CodexQuotaTray.exe`; build staging lives in `.agents_tmp` and is removed after publishing.
+
+InvisibleLauncher handoff files live in the invoking user's `%LOCALAPPDATA%\InvisibleLauncher\.app_tmp\relay`, with a unique protected directory granting access only to that user, the requested target user, and SYSTEM. Launching no longer requires write access to the executable directory. Windows `runas /savecred` credentials are per invoking Windows user; credentials saved by Jakub are not available to Lord Midious. If a first launch needs authentication, run `runas /savecred /user:aiaiai "cmd /c exit"` once in a visible terminal under that invoking user, then retry the launcher.

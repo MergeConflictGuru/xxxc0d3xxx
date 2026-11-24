@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -107,19 +107,43 @@ sealed class Settings
     // Existing chat in which the user authorized account-switch recovery; used for app-tool attribution.
     public string RecoveryControllerThreadId { get; set; } = "01a11bfc-788c-7ab1-9331-1535c01c284a";
     public string CodexHome { get; set; } = Environment.GetEnvironmentVariable("CODEX_HOME") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
-    public string CliPath { get; set; } = Path.Combine(Environment.GetEnvironmentVariable("CODEX_HOME") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex"), "plugins", ".plugin-appserver", "codex.exe");
-    public string CliArguments { get; set; } = "--no-daemon resume --all";
+    [JsonIgnore] public string CliPath { get; set; } = DefaultCliExecutable();
+    [JsonIgnore] public string CliArguments { get; set; } = "--no-daemon resume --all";
+    public string CliCommand { get; set; } = "";
+    public string AlternateLaunchCommand { get; set; } = "";
     public List<string> RemovedAccountKeys { get; set; } = [];
     public string DesktopPath { get; set; } = "";
     public string DesktopAppId { get; set; } = "";
     public bool StartWithWindows { get; set; }
     public List<Account> Accounts { get; set; } = [];
+    static string DefaultCliExecutable()
+    {
+        var legacy = Path.Combine(Environment.GetEnvironmentVariable("CODEX_HOME") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex"), "plugins", ".plugin-appserver", "codex.exe");
+        if (File.Exists(legacy)) return legacy;
+        var cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpenAI", "Codex", "bin");
+        try
+        {
+            if (Directory.Exists(cache))
+            {
+                var installed = Directory.EnumerateFiles(cache, "codex.exe", SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
+                if (installed != null) return installed;
+            }
+        }
+        catch (IOException) { } catch (UnauthorizedAccessException) { }
+        foreach (var folder in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+        {
+            try { var candidate = Path.Combine(folder.Trim('"'), "codex.exe"); if (File.Exists(candidate)) return candidate; }
+            catch (ArgumentException) { }
+        }
+        return legacy;
+    }
 }
 
 sealed class Store
 {
     public string DirectoryPath { get; }
     public Settings Data { get; }
+    public string? CacheSaveError { get; private set; }
     public string AuthPath => Path.Combine(Data.CodexHome, "auth.json");
     public Store(string? directory = null)
     {
@@ -132,6 +156,17 @@ sealed class Store
             if (File.Exists(legacy)) File.Copy(legacy, file, false);
         }
         Data = File.Exists(file) ? JsonSerializer.Deserialize<Settings>(File.ReadAllText(file), Json.Options) ?? new() : new();
+        if (string.IsNullOrWhiteSpace(Data.CliCommand))
+        {
+            if (File.Exists(file))
+            {
+                using var legacy = JsonDocument.Parse(File.ReadAllText(file));
+                Data.CliPath = legacy.RootElement.Get("CliPath").Text() ?? Data.CliPath;
+                Data.CliArguments = legacy.RootElement.Get("CliArguments").Text() ?? Data.CliArguments;
+            }
+            Data.CliCommand = $"\"{Data.CliPath}\" {Data.CliArguments}".Trim();
+            SaveCache();
+        }
     }
     internal static string ResolveDataDirectory(string executableDirectory)
     {
@@ -142,6 +177,17 @@ sealed class Store
         return Path.Combine(Path.GetFullPath(executableDirectory), "data");
     }
     public void Save() => AtomicWrite(Path.Combine(DirectoryPath, "settings.json"), JsonSerializer.Serialize(Data, Json.Options));
+    // Automatic metadata/cache writes must never gate authentication or process launch.
+    // Explicit settings changes still use Save() so callers can report a failed save.
+    public void SaveCache()
+    {
+        try { Save(); CacheSaveError = null; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            CacheSaveError = "Tray settings/cache could not be saved; changes are kept in memory.";
+            System.Diagnostics.Debug.WriteLine($"{CacheSaveError} {error.Message}");
+        }
+    }
     public string BackupPath(Identity identity)
     {
         var path = AuthPath + "." + identity.Suffix;
@@ -155,6 +201,26 @@ sealed class Store
         {
             var identity = new Identity(account.Key, account.Email, account.Name);
             var canonical = BackupPath(identity);
+            // A backup may have been renamed or copied alongside auth.json since discovery.
+            // Resolve by its credentials, never by an email-looking filename alone.
+            if (!File.Exists(canonical) && Directory.Exists(Data.CodexHome))
+            {
+                foreach (var candidate in Directory.EnumerateFiles(Data.CodexHome, "auth.json.*"))
+                {
+                    if (candidate.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)) continue;
+                    try
+                    {
+                        if (Identity.Read(candidate).Key != account.Key) continue;
+                        canonical = candidate;
+                        break;
+                    }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                    catch (JsonException) { }
+                    catch (FormatException) { }
+                    catch (InvalidOperationException) { }
+                }
+            }
             if (string.Equals(account.Backup, canonical, StringComparison.OrdinalIgnoreCase)) continue;
             // Salvage a legacy copy only if its contents really belong to this row.
             if (!File.Exists(canonical) && File.Exists(account.Backup))
@@ -197,7 +263,7 @@ sealed class Store
         account.Backup = BackupPath(identity);
         AtomicWrite(account.Backup, contents);
         account.Active = true;
-        Save();
+        SaveCache();
         return account;
     }
     public void DiscoverBackups()
@@ -453,7 +519,18 @@ static class CodexProcess
         ValidateLaunch(settings);
         if (settings.DesktopAppId != "" && !IsLauncher(settings))
             Process.Start(new ProcessStartInfo("explorer.exe", "shell:AppsFolder\\" + settings.DesktopAppId) { UseShellExecute = true });
-        else Process.Start(DesktopCommand.Parse(settings.DesktopPath).StartInfo());
+        else
+        {
+            using var launcher = Process.Start(DesktopCommand.Parse(settings.DesktopPath).StartInfo())
+                ?? throw new InvalidOperationException("Codex launcher could not start.");
+            if (IsLauncher(settings))
+            {
+                using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(7));
+                await launcher.WaitForExitAsync(deadline.Token);
+                if (launcher.ExitCode != 0)
+                    throw new InvalidOperationException($"InvisibleLauncher failed (exit {launcher.ExitCode}). See InvisibleLauncher.child.log and InvisibleLauncher.error.log beside the executable.");
+            }
+        }
         for (var attempt = 0; attempt < 240; attempt++)
         {
             await Task.Delay(250);

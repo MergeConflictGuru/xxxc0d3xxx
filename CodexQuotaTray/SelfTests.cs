@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 
 namespace CodexQuotaTray;
@@ -8,7 +8,7 @@ static class SelfTests
     public static int Run()
     {
         var results = new List<string>();
-        var directory = Path.Combine(Path.GetTempPath(), "CodexQuotaTray-test-" + Guid.NewGuid().ToString("N"));
+        var directory = Path.Combine(Environment.CurrentDirectory, ".agents_tmp", "CodexQuotaTray-test-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         try
         {
@@ -32,6 +32,18 @@ static class SelfTests
             if (simpleLaunch.Arguments.Length != 1 || simpleLaunch.Arguments[0] != "aiaiai" || !simpleLaunch.Executable.EndsWith("InvisibleLauncher.exe")) throw new Exception("Unquoted launcher command");
             if (!launch.StartInfo().ArgumentList.SequenceEqual(launch.Arguments)) throw new Exception("Launcher argument forwarding");
             results.Add("PASS Executable plus arguments supports positional username, quoted paths and quoted arguments");
+            var migrationFolder = Path.Combine(directory, "command-migration"); Directory.CreateDirectory(migrationFolder);
+            var oldArguments = "/user:aiaiai /savecred \"C:\\folder with spaces\\codex.exe --no-daemon resume --all\"";
+            File.WriteAllText(Path.Combine(migrationFolder, "settings.json"), JsonSerializer.Serialize(new { CliPath = "C:\\Windows\\System32\\runas.exe", CliArguments = oldArguments, DesktopPath = "original-desktop", AlternateLaunchCommand = "alternate-command" }));
+            var migrated = new Store(migrationFolder);
+            var migratedCommand = DesktopCommand.Parse(migrated.Data.CliCommand);
+            if (migratedCommand.Executable != "C:\\Windows\\System32\\runas.exe" || !migratedCommand.Arguments.SequenceEqual(new[] { "/user:aiaiai", "/savecred", "C:\\folder with spaces\\codex.exe --no-daemon resume --all" })) throw new Exception("CLI migration changed nested command arguments");
+            if (migrated.Data.DesktopPath != "original-desktop" || migrated.Data.AlternateLaunchCommand != "alternate-command") throw new Exception("CLI migration changed other launch commands");
+            using (var migratedJson = JsonDocument.Parse(File.ReadAllText(Path.Combine(migrationFolder, "settings.json"))))
+                if (migratedJson.RootElement.TryGetProperty("CliPath", out _) || migratedJson.RootElement.TryGetProperty("CliArguments", out _)) throw new Exception("Legacy split CLI settings were saved again");
+            migrated.Data.CliCommand = "\"C:\\custom path\\cli.exe\" --new"; migrated.Save();
+            if (new Store(migrationFolder).Data.CliCommand != migrated.Data.CliCommand) throw new Exception("Saved combined CLI command was overwritten");
+            results.Add("PASS Split CLI settings migrate to one command without changing nested arguments or other launches");
             var store = new Store(directory); store.Data.CodexHome = directory;
             string Fixture(string email, string id)
             {
@@ -59,6 +71,29 @@ static class SelfTests
             File.WriteAllText(two.Backup, Fixture("two@example.com", "two"));
             store.Save(); var loaded = new Store(directory);
             Check(loaded.Data.Accounts.Count == 3, "Account inventory persists across restarts");
+            var settingsFile = Path.Combine(directory, "settings.json");
+            var savedSettings = File.ReadAllText(settingsFile);
+            File.SetAttributes(settingsFile, FileAttributes.ReadOnly);
+            try
+            {
+                store.CaptureCurrent();
+                store.SaveCache();
+                Check(store.CacheSaveError != null && File.ReadAllText(settingsFile) == savedSettings,
+                    "Read-only settings do not block account capture or automatic cache updates");
+                var explicitSaveFailed = false;
+                try { store.Save(); } catch (UnauthorizedAccessException) { explicitSaveFailed = true; } catch (IOException) { explicitSaveFailed = true; }
+                Check(explicitSaveFailed, "Explicit settings saves still report write failures");
+                Check(!Directory.EnumerateFiles(directory, "settings.json.*.tmp").Any(), "Failed cache writes clean up temporary files");
+                File.WriteAllText(one.Backup, Fixture("wrong@example.com", "wrong"));
+                var authBefore = File.ReadAllText(store.AuthPath);
+                try { store.Restore(one); throw new Exception("Identity guard failed with read-only settings"); } catch (InvalidOperationException) { }
+                Check(File.ReadAllText(store.AuthPath) == authBefore, "Read-only cache does not bypass authentication identity checks");
+                File.WriteAllText(one.Backup, Fixture("one@example.com", "one"));
+            }
+            finally { File.SetAttributes(settingsFile, FileAttributes.Normal); }
+            store.SaveCache();
+            Check(store.CacheSaveError == null, "Cache save retries and clears warning when writes recover");
+
             using var quota = JsonDocument.Parse("""
                 {"rateLimits":{"primary":{"usedPercent":99,"windowDurationMins":300}},"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25,"windowDurationMins":10080,"resetsAt":2000000000},"secondary":{"usedPercent":60,"windowDurationMins":300,"resetsAt":1900000000}}},"rateLimitResetCredits":{"availableCount":2}}
                 """);
@@ -91,6 +126,12 @@ static class SelfTests
             two.Backup = Path.Combine(directory, "auth.json.missing-legacy");
             store.RepairBackupPaths();
             Check(one.Backup != store.AuthPath && two.Backup == store.AuthPath + ".two@example.com", "Legacy inventory repaired without assigning another account's live credentials");
+            var renamedBackup = store.AuthPath + ".two-renamed.json";
+            File.Move(two.Backup, renamedBackup);
+            store.RepairBackupPaths();
+            Check(two.Backup == renamedBackup, "Resolve renamed backup beside auth.json by exact identity");
+            File.Move(renamedBackup, store.AuthPath + ".two@example.com");
+            store.RepairBackupPaths();
             var densityNow = DateTimeOffset.FromUnixTimeSeconds(2000000000);
             Check(new QuotaWindow(50, 300, 2000000600).Density(densityNow) == 5
                 && new QuotaWindow(10, 300, 2000003600).Density(densityNow) == 1.5
