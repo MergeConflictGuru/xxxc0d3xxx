@@ -6,8 +6,8 @@ dist/
 *.log
 */bin/*
 */obj/*
-.app_tmp
-.agemts_tmp
+.app_tmp/
+.agents_tmp/
 *.pyc
 test_*.py
 test_*.?js
@@ -17,3 +17,4 @@ test_*.?js
 CodexQuotaTray/data/
 *-self-test.txt
 CodexQuotaTray/Scroll.png
+\!things!/chat-repair-backups/

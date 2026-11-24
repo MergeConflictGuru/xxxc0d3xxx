@@ -1,0 +1,12 @@
+<resources>
+    <style name="Nightcall.Day" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item><item name="android:colorAccent">#BD2467</item>
+        <item name="android:windowLightStatusBar">true</item><item name="android:statusBarColor">#DBF5EE</item>
+        <item name="android:navigationBarColor">#FFDAE8</item><item name="android:windowBackground">#FFF2EB</item>
+    </style>
+    <style name="Nightcall.Night" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item><item name="android:colorAccent">#FF53B4</item>
+        <item name="android:windowLightStatusBar">false</item><item name="android:statusBarColor">#102D38</item>
+        <item name="android:navigationBarColor">#30132D</item><item name="android:windowBackground">#100F24</item>
+    </style>
+</resources>

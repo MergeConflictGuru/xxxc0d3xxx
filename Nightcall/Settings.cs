@@ -6,7 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace DictationOverlay;
+namespace Nightcall;
 
 public sealed class Settings
 {
@@ -14,6 +14,55 @@ public sealed class Settings
     public uint Key { get; set; } = 0x20;
     public string AuthFile { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
     public string Language { get; set; } = "";
+    public string[] SignalingServers { get; set; } = DirectPeer.DefaultServers;
+    public string CloudflareTurnKeyId { get; set; } = "";
+    public string CloudflareTurnApiToken { get; set; } = "";
+    public string TurnUrl { get; set; } = "";
+    public string TurnUsername { get; set; } = "";
+    public string TurnCredential { get; set; } = "";
+    private static readonly HttpClient turnHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
+    public async Task<string> ResolveIceServersJson(CancellationToken cancel)
+    {
+        if (!string.IsNullOrWhiteSpace(CloudflareTurnKeyId) && !string.IsNullOrWhiteSpace(CloudflareTurnApiToken))
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"https://rtc.live.cloudflare.com/v1/turn/keys/{Uri.EscapeDataString(CloudflareTurnKeyId.Trim())}/credentials/generate-ice-servers");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", CloudflareTurnApiToken.Trim());
+            req.Content = new StringContent("{\"ttl\":86400}", System.Text.Encoding.UTF8, "application/json");
+            using var resp = await turnHttp.SendAsync(req, cancel);
+            resp.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(cancel));
+            if (doc.RootElement.TryGetProperty("iceServers", out var servers) && servers.ValueKind == JsonValueKind.Array)
+            {
+                var filtered = new System.Collections.Generic.List<object>();
+                foreach (var entry in servers.EnumerateArray())
+                {
+                    if (!entry.TryGetProperty("urls", out var urlsProp)) continue;
+                    var udpUrls = new System.Collections.Generic.List<string>();
+                    if (urlsProp.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var u in urlsProp.EnumerateArray())
+                            if (u.GetString() is string s && s.StartsWith("turn:", StringComparison.OrdinalIgnoreCase) && !s.Contains("transport=tcp", StringComparison.OrdinalIgnoreCase))
+                                udpUrls.Add(s);
+                    }
+                    else if (urlsProp.ValueKind == JsonValueKind.String && urlsProp.GetString() is string s && s.StartsWith("turn:", StringComparison.OrdinalIgnoreCase) && !s.Contains("transport=tcp", StringComparison.OrdinalIgnoreCase))
+                    {
+                        udpUrls.Add(s);
+                    }
+                    if (udpUrls.Count == 0) continue;
+                    filtered.Add(new
+                    {
+                        urls = udpUrls,
+                        username = entry.TryGetProperty("username", out var un) ? un.GetString() ?? "" : "",
+                        credential = entry.TryGetProperty("credential", out var cr) ? cr.GetString() ?? "" : ""
+                    });
+                }
+                return JsonSerializer.Serialize(filtered);
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(TurnUrl))
+            return JsonSerializer.Serialize(new[] { new { urls = new[] { TurnUrl.Trim() }, username = TurnUsername.Trim(), credential = TurnCredential } });
+        return "[]";
+    }
     public static string FilePath => Path.Combine(AppContext.BaseDirectory, "settings.json");
     public static Settings Load() => File.Exists(FilePath)
         ? JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new() : new();
@@ -66,8 +115,7 @@ public sealed class Transcriber : IDisposable
                     429 => "Transcription is rate limited. Wait a moment and retry.",
                     _ => $"Transcription service returned HTTP {status}. Your recording is kept in memory for Retry."
                 });
-            using var result = JsonDocument.Parse((string)http.ResponseText);
-            return result.RootElement.GetProperty("text").GetString()?.Trim() ?? "";
+            return TranscriptResponse.Parse((byte[])http.ResponseBody);
         }
         finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(http); }
     }, cancel);

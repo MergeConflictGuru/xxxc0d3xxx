@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <StartupObject>Nightcall.Program</StartupObject>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>2.6.2</Version>
+    <AssemblyName>Nightcall</AssemblyName>
+    <Product>Nightcall</Product>
+    <ApplicationIcon>Branding/day.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="android/**;tests/**;native/**;direct-demo/**" />
+    <None Include="native/bin/win-x64/nightcall_audio.dll" Link="nightcall_audio.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" Condition="Exists('native/bin/win-x64/nightcall_audio.dll')" />
+    <None Include="native/bin/win-x64/nightcall_net.dll" Link="nightcall_net.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" Condition="Exists('native/bin/win-x64/nightcall_net.dll')" />
+    <Resource Include="Branding/day.png;Branding/night.png;Branding/day.ico;Branding/night.ico" />
+    <Resource Include="Branding/tray-day.ico;Branding/tray-night.ico" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+  </ItemGroup>
+</Project>
