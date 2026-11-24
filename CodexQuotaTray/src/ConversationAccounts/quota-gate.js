@@ -27,17 +27,31 @@
     if (!paths.some(p => /\/app-primary-[a-f0-9]+\.js$/.test(p))) {
       const boot = [...document.scripts].map(s => s.src).find(p => /\/index-.*\.js$/.test(p));
       if (!boot) return;
-      const source = await (await fetch(boot)).text();
-      let names = source.match(/app-(?:initial|primary|shared)-[a-f0-9]+\.js/g) || [];
-      const initial = names.find(n => n.startsWith('app-initial-'));
-      if (initial) names.push(...((await (await fetch(new URL(initial, boot))).text()).match(/app-(?:primary|shared)-[a-f0-9]+\.js/g) || []));
-      paths.push(...names.map(n => new URL(n, boot).href));
+      // New bundles load primary through index.client/app-runtime rather than
+      // app-initial. Follow that small bootstrap graph even after timings clear.
+      const pending = [boot], visited = new Set();
+      while (pending.length && visited.size < 12) {
+        const url = pending.shift();
+        if (visited.has(url)) continue;
+        visited.add(url);
+        const source = await (await fetch(url)).text();
+        const names = source.match(/(?:app-(?:initial|primary|shared|runtime|main)|index\.client)-[a-f0-9]+\.js/g) || [];
+        for (const name of names) {
+          const path = new URL(name, url).href;
+          paths.push(path);
+          if (!visited.has(path) && !name.startsWith('app-shared-') && !name.startsWith('app-primary-')) pending.push(path);
+        }
+      }
     }
     const sharedPath = paths.find(p => /\/app-shared-[a-f0-9]+\.js$/.test(p));
     const primaryPath = paths.find(p => /\/app-primary-[a-f0-9]+\.js$/.test(p));
     if (!sharedPath || !primaryPath) return;
-    const shared = await import(sharedPath), primary = await import(primaryPath), gate = primary.W_;
-    if (!gate?.resolve || !gate.scope || typeof shared.don !== 'function' || typeof shared.aon !== 'function') throw Error('Unsupported GPT quota adapter version');
+    const shared = await import(sharedPath), primary = await import(primaryPath);
+    const current = primaryPath.endsWith('/app-primary-998934e837fc.js') && sharedPath.endsWith('/app-shared-b9a49a97ca55.js');
+    const gate = current ? primary.DG : primary.W_;
+    const mutable = current ? shared.ITt : shared.don;
+    const derived = current ? shared.ATt : shared.aon;
+    if (!gate?.resolve || !gate.scope || typeof mutable !== 'function' || typeof derived !== 'function') throw Error('Unsupported GPT quota adapter version');
     const editor = [...document.querySelectorAll('[contenteditable=true]')].find(e => e.getBoundingClientRect().width > 0);
     const node = editor?.parentElement;
     let fiber = node?.[Object.keys(node).find(k => k.startsWith('__reactFiber'))], map, record;
@@ -48,8 +62,8 @@
       if (record) { map = value; break; }
     }
     if (!record) return;
-    const original = {...gate}, available = shared.don(gate.scope, null);
-    const routedGate = shared.aon(gate.scope, ({get}) => {
+    const original = {...gate}, available = mutable(gate.scope, null);
+    const routedGate = derived(gate.scope, ({get}) => {
       const usable = get(available);
       return usable === null ? get(original) : !usable;
     });
@@ -87,3 +101,4 @@
   document.addEventListener('change', e => { if (e.target?.matches('#conversation-accounts-controls select')) setTimeout(refresh, 0); });
   refresh();
 })();
+

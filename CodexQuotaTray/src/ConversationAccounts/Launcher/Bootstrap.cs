@@ -34,6 +34,8 @@ static class Bootstrap
             if (saved != null) return saved;
         }
         catch { }
+        string profileRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "ConversationAccounts");
+        if (Ready(profileRoot)) return profileRoot;
         return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ConversationAccounts", "environment");
     }
     public sealed record Installation(string Executable, string? PackageFamily)
@@ -49,7 +51,8 @@ static class Bootstrap
         string output = process.StandardOutput.ReadToEnd(); process.StandardError.ReadToEnd();
         if (!process.WaitForExit(15000)) { process.Kill(); throw new IOException("Codex installation detection timed out."); }
         if (string.IsNullOrWhiteSpace(output)) return [];
-        var entries = JsonNode.Parse(output.TrimStart('\uFEFF'))!.AsArray();
+        var parsed = JsonNode.Parse(output.TrimStart('\uFEFF'))!;
+        var entries = parsed as JsonArray ?? new JsonArray(parsed);
         return entries.Select(entry => new Installation(entry!["exe"]!.GetValue<string>(), entry["family"]!.GetValue<string>())).ToList();
     }
     public static string? Configure(string initialRoot)
@@ -142,6 +145,22 @@ static class Bootstrap
         string appFolder = Path.GetDirectoryName(installation.Executable)!;
         string engine = Path.Combine(appFolder, "resources", "codex.exe");
         if (!File.Exists(installation.Executable) || !File.Exists(engine)) throw new IOException("Choose the desktop installation containing resources/codex.exe, not a standalone CLI executable.");
+        // The desktop copies its signed CLI out of WindowsApps so ordinary
+        // processes can execute it. Reuse only an exact copy of this installation.
+        string cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpenAI", "Codex", "bin");
+        if (Directory.Exists(cache))
+        {
+            using var original = File.OpenRead(engine);
+            var digest = SHA256.HashData(original);
+            foreach (string candidate in Directory.EnumerateFiles(cache, "codex.exe", SearchOption.AllDirectories))
+            {
+                if (new FileInfo(candidate).Length != new FileInfo(engine).Length) continue;
+                using var copy = File.OpenRead(candidate);
+                if (!SHA256.HashData(copy).SequenceEqual(digest)) continue;
+                engine = candidate;
+                break;
+            }
+        }
         if (root.Equals(Path.GetPathRoot(root), StringComparison.OrdinalIgnoreCase) || root.Equals(home, StringComparison.OrdinalIgnoreCase) || root.StartsWith(appFolder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || root.Equals(appFolder, StringComparison.OrdinalIgnoreCase)) throw new IOException("Choose a separate environment folder, not a drive root, Codex home, or original application folder.");
         if (Directory.Exists(root) && Directory.EnumerateFileSystemEntries(root).Any() && !File.Exists(Path.Combine(root, "bridge", "router-config.json")) && !File.Exists(Path.Combine(root, "conversation-accounts.install.json"))) throw new IOException("Select an empty folder or an existing Conversation Accounts environment.");
         Directory.CreateDirectory(root);
@@ -276,7 +295,7 @@ static class Bootstrap
         if (accounts != 1 || !Ready(environment)) throw new IOException("Fresh setup did not create a usable environment.");
         string python = Path.Combine(environment, "python", "python.exe");
         var check = new ProcessStartInfo(python) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-        check.ArgumentList.Add("-c"); check.ArgumentList.Add("import ssl,sqlite3,asyncio,websockets; print('private-runtime-ok')");
+        check.ArgumentList.Add("-c"); check.ArgumentList.Add("import ssl,sqlite3,asyncio,websockets,router,persistent; print('private-runtime-ok')");
         using (var process = Process.Start(check)!)
         {
             string output = process.StandardOutput.ReadToEnd(), error = process.StandardError.ReadToEnd(); process.WaitForExit();

@@ -16,6 +16,16 @@ try {
  # Use the engine bundled with the discovered installation, not a cached version path.
  $engine=Join-Path $newBase 'resources/codex.exe'
  if (!(Test-Path -LiteralPath $engine -PathType Leaf)) { throw 'Installed Codex engine is missing.' }
+ # An exact desktop-managed copy can run outside the package (persistent workers
+ # and startup-policy probes); the WindowsApps executable may deny that launch.
+ $cache=Join-Path $env:LOCALAPPDATA 'OpenAI/Codex/bin'
+ if (Test-Path -LiteralPath $cache -PathType Container) {
+  $expected=(Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash
+  foreach ($candidate in Get-ChildItem -LiteralPath $cache -Filter codex.exe -Recurse -File) {
+   if ($candidate.Length -ne (Get-Item -LiteralPath $engine).Length) { continue }
+   if ((Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256).Hash -eq $expected) { $engine=$candidate.FullName; break }
+  }
+ }
  $cfg.engine=$engine
  $cfg|ConvertTo-Json -Depth 30|Set-Content -LiteralPath (Join-Path $Root 'bridge/router-config.json')
 

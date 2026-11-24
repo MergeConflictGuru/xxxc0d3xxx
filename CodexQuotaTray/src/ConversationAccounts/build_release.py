@@ -52,7 +52,7 @@ def python_runtime(destination):
                     dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     for metadata in pathlib.Path(spec.origin).parent.parent.glob('websockets-*.dist-info'):
         shutil.copytree(metadata, destination / 'Lib/site-packages' / metadata.name, dirs_exist_ok=True)
-    (destination / 'python312._pth').write_text('python312.zip\nDLLs\nLib/site-packages\n.\nimport site\n')
+    (destination / 'python312._pth').write_text('python312.zip\nDLLs\nLib/site-packages\n.\n../bridge\nimport site\n')
     subprocess.run([str(destination / 'python.exe'), '-c',
                     'import ssl,sqlite3,asyncio,websockets; print("Bundled Python imports OK")'], check=True)
 

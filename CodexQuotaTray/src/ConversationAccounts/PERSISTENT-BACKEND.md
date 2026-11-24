@@ -1,5 +1,11 @@
 # Persistent multi-account backend
 
+When `webUiLauncher` in `bridge/router-config.json` names a CodexWeb `start.ps1`,
+normal desktop startup also starts/reuses that web server silently with
+`-RouterRoot <environment> -Background -NoBrowser`. Both UIs share this native
+backend and account routing. No browser tab opens. InvisibleLauncher does not
+own this integration; it only starts the supplied executable or stock Codex.
+
 The modified launcher starts or reuses one independent native app-server. Its
 short-lived ProtocolBridge clients attach over an authenticated loopback WebSocket.
 UI EOF disconnects its client only; it does not close the server. Ordinary stock

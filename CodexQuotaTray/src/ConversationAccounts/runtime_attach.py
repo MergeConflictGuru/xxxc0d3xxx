@@ -222,6 +222,18 @@ class Attachment:
             try:
                 await self.call('Runtime.enable')
                 await self.call('Page.enable')
+                # A reconnect must reattach the existing API's binding: UI
+                # closures and outstanding requests still reference that name.
+                existing = await self.call('Runtime.evaluate', {'expression': '''(() => {
+                    if (!window.conversationAccounts) return null;
+                    const keys = Object.keys(window);
+                    const binding = keys.find(k => /^__ca_[0-9a-f]{24}$/.test(k));
+                    const settle = keys.find(k => /^__ca_reply_[0-9a-f]{24}$/.test(k));
+                    return binding && settle ? {binding, settle} : null;
+                })()''', 'returnByValue': True})
+                names = existing.get('result', {}).get('value')
+                if names:
+                    self.binding, self.settle = names['binding'], names['settle']
                 await self.call('Runtime.addBinding', {'name': self.binding})
                 script = '''(() => {
                   if (location.origin !== 'app://-' || location.pathname !== '/index.html' || /detached-window/.test(new URL(location.href).searchParams.get('initialRoute') || '')) return;

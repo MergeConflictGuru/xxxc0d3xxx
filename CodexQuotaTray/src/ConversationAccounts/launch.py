@@ -105,6 +105,7 @@ def launch_installed(config):
             env.pop(key, None)
     from persistent import ensure, runtime
     persistent = ensure(ROOT)
+    start_web_ui(config)
     token = persistent['controlToken']
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
@@ -157,6 +158,31 @@ def launch_installed(config):
     else:
         raise RuntimeError('GPT started but multi-user controls did not become ready within 90 seconds. See bridge/runtime-attachment.log.')
     print('Launched installed Codex with runtime account controls', metadata['pid'])
+
+
+def start_web_ui(config):
+    """Start/reuse the light UI on this environment's persistent router."""
+    configured = config.get('webUiLauncher')
+    if not configured:
+        return
+    script = pathlib.Path(configured).resolve()
+    if not script.is_file():
+        raise RuntimeError('Configured lightweight UI launcher is missing: ' + str(script))
+    powershell = pathlib.Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    command = [str(powershell), '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+               '-ExecutionPolicy', 'Bypass', '-File', str(script), '-RouterRoot', str(ROOT), '-Background', '-NoBrowser']
+    # Start-Process can leave redirected pipe handles in the background Node
+    # server after PowerShell exits. Files let startup finish independently of it.
+    log_path = ROOT / '.app_tmp/launcher/web-ui.log'
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open('wb') as log:
+        result = subprocess.run(command, cwd=ROOT, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT,
+                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=90)
+    if result.returncode:
+        detail = log_path.read_text(encoding='utf-8', errors='replace')[-2500:]
+        raise RuntimeError('Lightweight UI startup failed: ' + detail)
+    print('Lightweight UI connected to the shared multi-account backend (localhost:4783)')
 
 
 if __name__ == '__main__':

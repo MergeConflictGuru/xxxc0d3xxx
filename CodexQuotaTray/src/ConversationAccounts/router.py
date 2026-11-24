@@ -918,8 +918,12 @@ def serve_control(router, loop, token, endpoint_path):
     return server
 
 
+def is_app_server_session(arguments):
+    return 'app-server' in arguments and '--print-startup-config' not in arguments
+
+
 def is_gui_router(arguments, token):
-    return (bool(token) and 'app-server' in arguments
+    return (bool(token) and is_app_server_session(arguments)
             and 'features.prefer_mxc=true' in arguments)
 
 
@@ -939,7 +943,7 @@ def claim_control_owner(endpoint_path):
 
 
 async def main():
-    if os.environ.get('CA_PERSISTENT_RECORD') and 'app-server' in sys.argv[1:]:
+    if os.environ.get('CA_PERSISTENT_RECORD') and is_app_server_session(sys.argv[1:]):
         from persistent import relay
         record = json.loads(pathlib.Path(os.environ['CA_PERSISTENT_RECORD']).read_text())
         await relay(record)
@@ -956,7 +960,7 @@ async def main():
         arguments = sys.argv[1:]
         # Auxiliary native app servers receive phone requests internally, outside
         # our stdio router. Route their inference while preserving remote auth.
-        if token and 'app-server' in arguments:
+        if token and is_app_server_session(arguments):
             from remote_inference import RemoteInference
             adapter = RemoteInference(config, endpoint_path, token, ROOT).start()
             arguments = adapter.configure(arguments, env)
