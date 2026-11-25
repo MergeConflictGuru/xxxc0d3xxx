@@ -62,11 +62,6 @@ public final class MainActivity extends Activity {
     }
     private void handleIntent(Intent intent) {
         if (intent == null) return;
-        if (Intent.ACTION_SEND.equals(intent.getAction())) {
-            RelayService.sendSharedIntent(this, intent, msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show());
-            if (pairings.hasAny()) ensureRunning();
-            return;
-        }
         if (intent.getData() != null) pendingPair = intent.getData().toString();
         if (pendingPair != null) ensureRunning();
         else if (intent.hasExtra("startKind")) { requestedCommand = intent.getStringExtra("startKind"); ensureRunning(); }
@@ -103,12 +98,6 @@ public final class MainActivity extends Activity {
         TextView micHint = style.text(this, "Off while idle. Sleeps after ten idle minutes. Dictation from either device restarts the timer. Keep running for calls or other Windows apps.", 12, true); microphone.addView(micHint); panel.addView(microphone);
         TextView controlsHint = style.text(this, "Finish & send pastes and presses Enter. Paste only inserts text without Enter.\n\nPress both volume buttons to start. While recording, a short press finishes and sends. Hold both for one second to finish without Enter: a brief vibration means you can let go. Screen-off button delivery depends on your phone.", 12, true);
         controlsHint.setPadding(0, 0, 0, NightcallStyle.dp(this, 24)); panel.addView(controlsHint);
-        panel.addView(style.button(this, "Send clipboard to PC", false, () -> {
-            ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-            ClipData clip = cm == null ? null : cm.getPrimaryClip();
-            RelayService.sendClipData(this, clip, true, msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show());
-            if (RelayService.instance == null && pairings.hasAny()) ensureRunning();
-        }));
         panel.addView(style.button(this, "Scan pairing QR", false, () -> {
             if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) requestPermissions(new String[] { Manifest.permission.CAMERA }, 2);
             else startActivityForResult(new Intent(this, ScanActivity.class), 10);
@@ -160,14 +149,6 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == 10 && result == RESULT_OK && data != null) { pendingPair = data.getStringExtra("pair"); ensureRunning(); }
-    }
-    @Override public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        if (hasFocus && RelayService.instance != null) {
-            ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-            ClipData clip = cm == null ? null : cm.getPrimaryClip();
-            if (clip != null) RelayService.sendClipData(this, clip, false, null);
-        }
     }
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (keys.handle(event)) return true;

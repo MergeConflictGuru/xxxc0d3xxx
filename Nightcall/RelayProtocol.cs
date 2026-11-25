@@ -12,7 +12,7 @@ namespace Nightcall;
 public static class RelayProtocol
 {
     public const int Port = 47831, DiscoveryPort = 47832, Rate = 16000;
-    public const byte Json = 1, Audio = 2, Opus = 3, Apk = 4, Clip = 5;
+    public const byte Json = 1, Audio = 2, Opus = 3, Apk = 4;
     public static readonly JsonSerializerOptions Options = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     public static async Task Write(Stream stream, byte type, byte[] payload, CancellationToken cancel)
     {
@@ -30,7 +30,7 @@ public static class RelayProtocol
         int size = BinaryPrimitives.ReadInt32BigEndian(header);
         if (size < 2 || size > 4096) throw new InvalidDataException("Invalid relay packet length.");
         var frame = new byte[size]; await stream.ReadExactlyAsync(frame, cancel);
-        if (frame[0] != Json && frame[0] != Audio && frame[0] != Opus && frame[0] != Apk && frame[0] != Clip) throw new InvalidDataException("Unknown relay packet type.");
+        if (frame[0] != Json && frame[0] != Audio && frame[0] != Opus && frame[0] != Apk) throw new InvalidDataException("Unknown relay packet type.");
         return (frame[0], frame[1..]);
     }
 }

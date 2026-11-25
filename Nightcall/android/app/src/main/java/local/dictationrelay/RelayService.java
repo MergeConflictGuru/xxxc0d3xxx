@@ -51,16 +51,6 @@ public final class RelayService extends Service {
     private volatile boolean pairingOnly;
     private String pendingCommand;
     private long pendingUntil;
-    private static final int MAX_CLIP_BYTES = 10 * 1024 * 1024;
-    private static volatile String lastClipHash = "";
-    private static final Object pendingClipLock = new Object();
-    private static String pendingClipMime;
-    private static byte[] pendingClipData;
-    private static long pendingClipUntil;
-    private static volatile long suppressClipReadUntil;
-    private ClipboardManager.OnPrimaryClipChangedListener clipListener;
-    private volatile java.lang.Process clipLogcat;
-    private volatile long lastOverlayRead;
 
     static boolean keepRunning(Context context) { return context.getSharedPreferences("session", MODE_PRIVATE).getBoolean("keep", false); }
     static boolean microphoneRunning() { RelayService service = instance; return service != null && !service.pairingOnly; }
@@ -106,7 +96,6 @@ public final class RelayService extends Service {
                 new Thread(this::discover, "RelayDiscovery").start();
                 connectionThread = new Thread(this::connectLoop, "RelayConnection"); connectionThread.start();
                 new Thread(this::watchWrites, "RelayWatchdog").start();
-                startClipboardWatch();
             } catch (Exception e) { status = "Could not start: " + e.getMessage(); stopSelf(); return START_NOT_STICKY; }
         }
         if (!pair) requestCommand(intent == null ? null : "toggle".equals(intent.getAction()) ? "toggle" : intent.getStringExtra("command"));
@@ -116,13 +105,11 @@ public final class RelayService extends Service {
         Intent open = new Intent(this, MainActivity.class);
         PendingIntent view = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         PendingIntent toggle = PendingIntent.getService(this, 1, new Intent(this, RelayService.class).setAction("toggle"), PendingIntent.FLAG_IMMUTABLE);
-        PendingIntent sendClip = PendingIntent.getActivity(this, 3, new Intent(this, ClipboardReadActivity.class).putExtra("force", true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         PendingIntent stop = PendingIntent.getService(this, 2, new Intent(this, RelayService.class).setAction("stop"), PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, "relay").setSmallIcon(R.drawable.ic_notification).setLargeIcon(android.graphics.BitmapFactory.decodeResource(getResources(), ThemeClock.night() ? R.drawable.nightcall_night : R.drawable.nightcall_day)).setColor(NightcallStyle.color("#FF53B4")).setContentTitle("Nightcall")
             .setContentText(status + ("idle".equals(dictation) ? "" : " · " + dictation)).setOngoing(true).setContentIntent(view)
-            .addAction(new Notification.Action.Builder(null, "Dictation", toggle).build())
-            .addAction(new Notification.Action.Builder(null, "Send clipboard", sendClip).build())
-            .addAction(new Notification.Action.Builder(null, "Stop", stop).build()).build();
+            .addAction(new Notification.Action.Builder(null, "Start / finish dictation", toggle).build())
+            .addAction(new Notification.Action.Builder(null, "Stop relay", stop).build()).build();
     }
     private void update(String text) { status = text; if (running) getSystemService(NotificationManager.class).notify(1, notification()); }
     private void discover() {
@@ -356,23 +343,14 @@ public final class RelayService extends Service {
             String queued;
             synchronized (this) { queued = SystemClock.elapsedRealtime() < pendingUntil ? pendingCommand : null; pendingCommand = null; }
             if (queued != null) sendCommand(queued, w); String t = traceText(); if (t.length() > 3000) t = t.substring(t.length() - 3000); try { w.send(Wire.message("trace").put("text", t)); } catch (Exception ignored) { }
-            flushPendingClipboard();
             java.io.File partFile = new java.io.File(getCacheDir(), "update.apk.part");
             java.io.File shaFile = new java.io.File(getCacheDir(), "update.apk.sha");
             java.io.FileOutputStream apkOut = null;
             long apkBytes = 0;
             int ackBatch = 0;
-            java.io.ByteArrayOutputStream clipOut = null;
-            String clipMime = "", clipSha = "";
-            long clipSize = 0;
             try {
                 while (running && pairingUri == null) {
                     Wire.Frame frame = w.readFrame();
-                    if (frame.type == Wire.CLIP) {
-                        if (clipOut != null && clipOut.size() + frame.data.length <= MAX_CLIP_BYTES) clipOut.write(frame.data);
-                        else clipOut = null;
-                        continue;
-                    }
                     if (frame.type == Wire.APK) {
                         if (apkOut == null) {
                             long offset = resumeOffset(partFile, shaFile, availableUpdateSha256, availableUpdateSize);
@@ -431,21 +409,6 @@ public final class RelayService extends Service {
                         partFile.delete(); shaFile.delete();
                         updateProgress = -1;
                         updateError = message.optString("message", "Update failed");
-                    } else if ("clipStart".equals(kind)) {
-                        clipMime = message.optString("mime", "");
-                        clipSize = message.optLong("size", 0);
-                        clipSha = message.optString("sha256", "");
-                        clipOut = (clipSize > 0 && clipSize <= MAX_CLIP_BYTES && !clipMime.isEmpty())
-                            ? new java.io.ByteArrayOutputStream((int)Math.min(clipSize, 65536)) : null;
-                    } else if ("clipDone".equals(kind)) {
-                        if (clipOut != null) {
-                            byte[] clipData = clipOut.toByteArray();
-                            clipOut = null;
-                            String expectedSha = !clipSha.isEmpty() ? clipSha : message.optString("sha256", "");
-                            if (clipData.length == clipSize && expectedSha.equalsIgnoreCase(sha256Bytes(clipData))) {
-                                applyRemoteClipboard(clipMime, clipData, expectedSha);
-                            }
-                        }
                     }
                 }
             } finally {
@@ -570,186 +533,6 @@ public final class RelayService extends Service {
         for (byte b : bytes) sb.append(String.format("%02x", b & 255));
         return sb.toString();
     }
-    private static String sha256Bytes(byte[] data) {
-        try { return toHex(MessageDigest.getInstance("SHA-256").digest(data)); }
-        catch (Exception e) { return ""; }
-    }
-    private void applyRemoteClipboard(String mime, byte[] data, String sha) {
-        lastClipHash = sha;
-        suppressClipReadUntil = SystemClock.elapsedRealtime() + 1500;
-        lease.touch(SystemClock.elapsedRealtime());
-        if (mime.startsWith("image/")) {
-            try {
-                java.io.File tmp = new java.io.File(getCacheDir(), "clip.png.tmp");
-                java.io.File dst = new java.io.File(getCacheDir(), "clip.png");
-                try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp, false)) { out.write(data); }
-                if (dst.exists()) dst.delete();
-                if (!tmp.renameTo(dst)) return;
-                new Handler(Looper.getMainLooper()).post(() -> {
-                    try {
-                        ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-                        if (cm != null) cm.setPrimaryClip(ClipData.newUri(getContentResolver(), "Nightcall", android.net.Uri.parse("content://local.dictationrelay.apk/clip.png")));
-                    } catch (Exception ignored) { }
-                });
-            } catch (Exception ignored) { }
-        } else if ("text/plain".equals(mime)) {
-            String text = new String(data, StandardCharsets.UTF_8);
-            new Handler(Looper.getMainLooper()).post(() -> {
-                try {
-                    ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("Nightcall", text));
-                } catch (Exception ignored) { }
-            });
-        }
-    }
-    private void flushPendingClipboard() {
-        String mime; byte[] data;
-        synchronized (pendingClipLock) {
-            if (pendingClipData == null || SystemClock.elapsedRealtime() >= pendingClipUntil) {
-                pendingClipMime = null; pendingClipData = null; return;
-            }
-            mime = pendingClipMime; data = pendingClipData;
-            pendingClipMime = null; pendingClipData = null;
-        }
-        sendClipboard(mime, data);
-    }
-    static void sendClipboard(String mime, byte[] data) {
-        if (mime == null || mime.isEmpty() || data == null || data.length == 0 || data.length > MAX_CLIP_BYTES) return;
-        String sha = sha256Bytes(data);
-        lastClipHash = sha;
-        RelayService service = instance;
-        Wire current = service == null ? null : service.wire;
-        if (service == null || current == null) {
-            synchronized (pendingClipLock) {
-                pendingClipMime = mime; pendingClipData = data;
-                pendingClipUntil = SystemClock.elapsedRealtime() + 30_000;
-            }
-            return;
-        }
-        service.lease.touch(SystemClock.elapsedRealtime());
-        service.controls.execute(() -> {
-            try {
-                if (service.wire != current) return;
-                current.send(Wire.message("clipStart").put("mime", mime).put("size", data.length).put("sha256", sha));
-                int sentChunks = 0;
-                for (int off = 0; off < data.length && service.wire == current; off += 3800) {
-                    int n = Math.min(3800, data.length - off);
-                    current.clip(data, off, n);
-                    service.lastWrite = SystemClock.elapsedRealtime();
-                    if (++sentChunks % 4 == 0) Thread.sleep(25);
-                }
-                if (service.wire == current) {
-                    current.send(Wire.message("clipDone").put("sha256", sha));
-                    service.lastWrite = SystemClock.elapsedRealtime();
-                }
-            } catch (Exception ignored) { }
-        });
-    }
-    static void sendClipData(Context context, ClipData clip, boolean force, java.util.function.Consumer<String> onResult) {
-        if (clip == null || clip.getItemCount() == 0) {
-            if (onResult != null) onResult.accept("Clipboard is empty");
-            return;
-        }
-        Context app = context.getApplicationContext();
-        ClipData.Item item = clip.getItemAt(0);
-        ClipDescription desc = clip.getDescription();
-        android.net.Uri uri = item.getUri();
-        boolean isImage = uri != null && (
-            (desc != null && (desc.hasMimeType("image/*") || desc.hasMimeType("image/png") || desc.hasMimeType("image/jpeg") || desc.hasMimeType("image/webp")))
-            || (app.getContentResolver().getType(uri) != null && app.getContentResolver().getType(uri).startsWith("image/"))
-        );
-        CharSequence textSeq = isImage ? null : item.coerceToText(app);
-        new Thread(() -> {
-            String msg = null;
-            if (isImage) {
-                byte[] png = readImageAsPng(app, uri);
-                if (png == null) msg = "Could not read image (max 10 MB)";
-                else {
-                    String sha = sha256Bytes(png);
-                    if (force || !sha.equalsIgnoreCase(lastClipHash)) {
-                        sendClipboard("image/png", png);
-                        msg = "Sent image to PC clipboard";
-                    }
-                }
-            } else if (textSeq != null && textSeq.length() > 0) {
-                byte[] bytes = textSeq.toString().getBytes(StandardCharsets.UTF_8);
-                if (bytes.length > MAX_CLIP_BYTES) msg = "Text too large";
-                else {
-                    String sha = sha256Bytes(bytes);
-                    if (force || !sha.equalsIgnoreCase(lastClipHash)) {
-                        sendClipboard("text/plain", bytes);
-                        msg = "Sent text to PC clipboard";
-                    }
-                }
-            } else if (force) {
-                msg = "Clipboard is empty";
-            }
-            if (onResult != null && msg != null) {
-                String finalMsg = msg;
-                new Handler(Looper.getMainLooper()).post(() -> onResult.accept(finalMsg));
-            }
-        }, "ClipSend").start();
-    }
-    static void sendSharedIntent(Context context, Intent intent, java.util.function.Consumer<String> onResult) {
-        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) return;
-        Context app = context.getApplicationContext();
-        String type = intent.getType();
-        if (type != null && type.startsWith("image/")) {
-            @SuppressWarnings("deprecation")
-            android.net.Uri uri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
-            if (uri == null) return;
-            new Thread(() -> {
-                byte[] png = readImageAsPng(app, uri);
-                String msg;
-                if (png != null) { sendClipboard("image/png", png); msg = "Sending image to PC clipboard…"; }
-                else msg = "Could not read shared image";
-                if (onResult != null) new Handler(Looper.getMainLooper()).post(() -> onResult.accept(msg));
-            }, "ClipShare").start();
-        } else {
-            CharSequence text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
-            if (text == null || text.length() == 0) return;
-            byte[] bytes = text.toString().getBytes(StandardCharsets.UTF_8);
-            if (bytes.length <= MAX_CLIP_BYTES) {
-                sendClipboard("text/plain", bytes);
-                if (onResult != null) onResult.accept("Sending text to PC clipboard…");
-            }
-        }
-    }
-    private static byte[] readImageAsPng(Context context, android.net.Uri uri) {
-        try {
-            byte[] raw;
-            try (java.io.InputStream in = context.getContentResolver().openInputStream(uri)) {
-                if (in == null) return null;
-                java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
-                byte[] chunk = new byte[16384]; int n;
-                while ((n = in.read(chunk)) > 0) {
-                    if (buf.size() + n > 24 * 1024 * 1024) return null;
-                    buf.write(chunk, 0, n);
-                }
-                raw = buf.toByteArray();
-            }
-            if (raw.length == 0) return null;
-            boolean isPng = raw.length >= 8
-                && (raw[0] & 0xFF) == 0x89 && raw[1] == 0x50 && raw[2] == 0x4E && raw[3] == 0x47
-                && raw[4] == 0x0D && raw[5] == 0x0A && raw[6] == 0x1A && raw[7] == 0x0A;
-            if (isPng && raw.length <= MAX_CLIP_BYTES) return raw;
-            android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.length);
-            if (bmp == null) return null;
-            try {
-                for (int attempt = 0; attempt < 4; attempt++) {
-                    java.io.ByteArrayOutputStream pngOut = new java.io.ByteArrayOutputStream();
-                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, pngOut);
-                    byte[] png = pngOut.toByteArray();
-                    if (png.length <= MAX_CLIP_BYTES) return png;
-                    int nw = Math.max(1, (int)(bmp.getWidth() * 0.7)), nh = Math.max(1, (int)(bmp.getHeight() * 0.7));
-                    android.graphics.Bitmap scaled = android.graphics.Bitmap.createScaledBitmap(bmp, nw, nh, true);
-                    if (scaled != bmp) bmp.recycle();
-                    bmp = scaled;
-                }
-                return null;
-            } finally { bmp.recycle(); }
-        } catch (Exception e) { return null; }
-    }
     static void command(String kind) {
         RelayService service = instance; if (service != null) service.requestCommand(kind);
     }
@@ -782,63 +565,8 @@ public final class RelayService extends Service {
         if (text.length() != 64 || !text.matches("[0-9a-fA-F]+")) throw new Exception("Invalid PC identity");
         byte[] bytes = new byte[text.length() / 2]; for (int i = 0; i < bytes.length; i++) bytes[i] = (byte)Integer.parseInt(text.substring(i * 2, i * 2 + 2), 16); return bytes;
     }
-    private void stopClipboardWatch() {
-        ClipboardManager.OnPrimaryClipChangedListener listener = clipListener;
-        clipListener = null;
-        if (listener != null) {
-            try {
-                ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-                if (cm != null) cm.removePrimaryClipChangedListener(listener);
-            } catch (Exception ignored) { }
-        }
-        java.lang.Process p = clipLogcat; clipLogcat = null;
-        if (p != null) try { p.destroyForcibly(); } catch (Exception ignored) { }
-    }
-    private void startClipboardWatch() {
-        new Handler(Looper.getMainLooper()).post(() -> {
-            if (!running) return;
-            ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
-            if (cm == null) return;
-            clipListener = () -> {
-                if (!running || wire == null || SystemClock.elapsedRealtime() < suppressClipReadUntil) return;
-                try {
-                    ClipData clip = cm.getPrimaryClip();
-                    if (clip != null && clip.getItemCount() > 0) sendClipData(this, clip, false, null);
-                } catch (Exception ignored) { }
-            };
-            cm.addPrimaryClipChangedListener(clipListener);
-        });
-        if (checkSelfPermission(Manifest.permission.READ_LOGS) == PackageManager.PERMISSION_GRANTED && android.provider.Settings.canDrawOverlays(this)) {
-            new Thread(this::watchClipboardLogs, "RelayClipLog").start();
-        }
-    }
-    private void watchClipboardLogs() {
-        try {
-            java.lang.Process p = new ProcessBuilder("logcat", "-T", "1", "ClipboardService:D", "SemClipboardService:D", "*:S").redirectErrorStream(true).start();
-            clipLogcat = p;
-            String pkg = getPackageName();
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while (running && (line = reader.readLine()) != null) {
-                    String lower = line.toLowerCase(java.util.Locale.US);
-                    if (!lower.contains(pkg) && !lower.contains("setprimaryclip") && !lower.contains("adddata")) continue;
-                    long now = SystemClock.elapsedRealtime();
-                    if (wire == null || now < suppressClipReadUntil || now - lastOverlayRead < 400) continue;
-                    lastOverlayRead = now;
-                    readClipboardViaOverlay();
-                }
-            }
-        } catch (Exception ignored) { }
-    }
-    private void readClipboardViaOverlay() {
-        if (!android.provider.Settings.canDrawOverlays(this)) return;
-        try {
-            startActivity(new Intent(this, ClipboardReadActivity.class)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
-        } catch (Exception ignored) { }
-    }
     @Override public void onDestroy() {
-        running = false; instance = null; stopClipboardWatch(); availableUpdateVersion = 0; availableUpdateName = ""; updateProgress = -1; updateReady = false; closeConnection(); if (discovery != null) discovery.close();
+        running = false; instance = null; availableUpdateVersion = 0; availableUpdateName = ""; updateProgress = -1; updateReady = false; closeConnection(); if (discovery != null) discovery.close();
         if (connectionThread != null) connectionThread.interrupt(); controls.shutdownNow();
         if (wake != null && wake.isHeld()) wake.release(); if (multicast != null && multicast.isHeld()) multicast.release();
         if (!pairingResult && !status.startsWith("Could not start:") && !status.startsWith("Open Nightcall")) status = "Idle · microphone off"; dictation = "idle"; stopForeground(STOP_FOREGROUND_REMOVE); super.onDestroy();

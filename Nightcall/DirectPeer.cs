@@ -132,7 +132,7 @@ public sealed class DirectPeer : IDisposable
     {
         while (!stopping.IsCancellationRequested)
         {
-            using var ws = new ClientWebSocket(); ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(5); sockets[server] = ws;
+            using var ws = new ClientWebSocket(); ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(5); ws.Options.KeepAliveTimeout = TimeSpan.FromSeconds(8); sockets[server] = ws;
             try
             {
                 using var connect = CancellationTokenSource.CreateLinkedTokenSource(stopping.Token); connect.CancelAfter(TimeSpan.FromSeconds(12));

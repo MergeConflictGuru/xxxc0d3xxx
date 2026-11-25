@@ -46,8 +46,6 @@ public sealed class RelayHost : IDisposable
     public event Action<byte[]>? Audio;
     public event Action<byte[]>? StereoAudio;
     public event Action<string>? Command;
-    public event Action<string, byte[]>? ClipboardReceived;
-    private Func<string, byte[], Task>? sendClip;
     public event Action? Changed;
     public bool Connected { get { lock (gate) return active != null; } }
     public string PhoneName { get { lock (gate) return phoneName; } }
@@ -57,7 +55,6 @@ public sealed class RelayHost : IDisposable
     public bool Muted { get { lock (gate) return muted; } set { lock (gate) { muted = value; revision++; } Changed?.Invoke(); } }
     public RelayHost(int port = RelayProtocol.Port, string? storePath = null, bool advertise = true) { this.port = port; this.storePath = storePath; this.advertise = advertise; }
     public void SetState(string value) { lock (gate) { state = value; revision++; } }
-    public void SendClipboard(string mime, byte[] data) { Func<string, byte[], Task>? fn; lock (gate) fn = sendClip; if (fn != null && data.Length is > 0 and <= 10 * 1024 * 1024) _ = fn(mime, data); }
     public Task Start() => Task.Run(() =>
     {
         try
@@ -241,34 +238,6 @@ public sealed class RelayHost : IDisposable
                 var updates = SendUpdates(tls, writeGate, life.Token);
                 Task? apkTransfer = null;
                 SemaphoreSlim? apkCredit = null;
-                MemoryStream? clipBuf = null;
-                string clipMime = "", clipExpectedSha = "";
-                long clipExpectedSize = 0;
-                using var clipSendGate = new SemaphoreSlim(1, 1);
-                lock (gate) sendClip = async (mime, data) =>
-                {
-                    await clipSendGate.WaitAsync(life.Token);
-                    try
-                    {
-                        string sha = Convert.ToHexStringLower(SHA256.HashData(data));
-                        Trace($"clip-tx {mime} {data.Length}B");
-                        await SendLocked(tls, writeGate, new { kind = "clipStart", mime, size = data.Length, sha256 = sha }, life.Token);
-                        int sentChunks = 0;
-                        for (int off = 0; off < data.Length; off += 3800)
-                        {
-                            int n = Math.Min(3800, data.Length - off);
-                            byte[] chunk = data[off..(off + n)];
-                            await writeGate.WaitAsync(life.Token);
-                            try { await RelayProtocol.Write(tls, RelayProtocol.Clip, chunk, life.Token); }
-                            finally { writeGate.Release(); }
-                            if (++sentChunks % 4 == 0) await Task.Delay(25, life.Token);
-                        }
-                        await SendLocked(tls, writeGate, new { kind = "clipDone", sha256 = sha }, life.Token);
-                        Trace($"clip-tx-done {mime} {data.Length}B");
-                    }
-                    catch (Exception ex) { Trace("clip-tx-err " + ex.Message); }
-                    finally { clipSendGate.Release(); }
-                };
                 try
                 {
                     long lastCommand = -1;
@@ -286,11 +255,6 @@ public sealed class RelayHost : IDisposable
                             byte[] decoded = opus.Decode(frame.Data), mono = opus.DecodeMono(frame.Data);
                             if (!Muted) { Audio?.Invoke(mono); StereoAudio?.Invoke(decoded); }
                         }
-                        else if (frame.Type == RelayProtocol.Clip)
-                        {
-                            if (clipBuf != null && clipBuf.Length + frame.Data.Length <= 10 * 1024 * 1024)
-                                clipBuf.Write(frame.Data, 0, frame.Data.Length);
-                        }
                         else
                         {
                             using var message = JsonDocument.Parse(frame.Data);
@@ -303,33 +267,6 @@ public sealed class RelayHost : IDisposable
                             }
                             else if (command == "mute") Muted = r.GetProperty("value").GetBoolean();
                             else if (command == "trace") { lock (gate) phoneTrace = r.TryGetProperty("text", out var tp) ? tp.GetString() ?? "" : ""; }
-                            else if (command == "clipStart")
-                            {
-                                clipBuf?.Dispose();
-                                long sz = r.TryGetProperty("size", out var sp) && sp.TryGetInt64(out long v) ? v : 0;
-                                if (sz is > 0 and <= 10 * 1024 * 1024)
-                                {
-                                    clipMime = r.TryGetProperty("mime", out var mp) ? mp.GetString() ?? "text/plain" : "text/plain";
-                                    clipExpectedSha = r.TryGetProperty("sha256", out var hp) ? hp.GetString() ?? "" : "";
-                                    clipExpectedSize = sz;
-                                    clipBuf = new MemoryStream((int)Math.Min(sz, 1024 * 1024));
-                                }
-                                else clipBuf = null;
-                            }
-                            else if (command == "clipDone")
-                            {
-                                if (clipBuf != null)
-                                {
-                                    byte[] payload = clipBuf.ToArray();
-                                    clipBuf.Dispose(); clipBuf = null;
-                                    string actualSha = Convert.ToHexStringLower(SHA256.HashData(payload));
-                                    if (payload.Length == clipExpectedSize && string.Equals(actualSha, clipExpectedSha, StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        Trace($"clip-rx {clipMime} {payload.Length}B");
-                                        ClipboardReceived?.Invoke(clipMime, payload);
-                                    }
-                                }
-                            }
                             else if (command == "getApk" && (apkTransfer == null || apkTransfer.IsCompleted))
                             {
                                 long offset = r.TryGetProperty("offset", out var offProp) && offProp.TryGetInt64(out long o) && o >= 0 ? o : 0;
@@ -346,7 +283,7 @@ public sealed class RelayHost : IDisposable
                         }
                     }
                 }
-                finally { lock (gate) { if (ReferenceEquals(active, connection)) sendClip = null; } clipBuf?.Dispose(); life.Cancel(); try { await updates; } catch (OperationCanceledException) { } if (apkTransfer != null) try { await apkTransfer; } catch { } apkCredit?.Dispose(); }
+                finally { life.Cancel(); try { await updates; } catch (OperationCanceledException) { } if (apkTransfer != null) try { await apkTransfer; } catch { } apkCredit?.Dispose(); }
             }
             catch (Exception e) when (e is IOException or SocketException or AuthenticationException or OperationCanceledException or JsonException or InvalidOperationException or KeyNotFoundException or FormatException) { Trace("session-end path=" + path + " " + e.GetType().Name + ": " + e.Message); }
             finally

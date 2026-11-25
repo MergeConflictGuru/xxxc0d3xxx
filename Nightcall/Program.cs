@@ -155,8 +155,6 @@ public sealed class Overlay : Window, IDisposable
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] private static extern IntPtr GetStyle(IntPtr handle, int index);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] private static extern IntPtr SetStyle(IntPtr handle, int index, IntPtr value);
     [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
-    [DllImport("user32.dll")] private static extern bool AddClipboardFormatListener(IntPtr hwnd);
-    [DllImport("user32.dll")] private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, Input[] inputs, int size);
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput { public ushort Key, Scan; public uint Flags, Time; public UIntPtr Extra; }
@@ -185,13 +183,11 @@ public sealed class Overlay : Window, IDisposable
     private RelayHost? relay;
     private InstallServer? installServer;
     private readonly VirtualMicrophone virtualMicrophone = new();
+    private readonly MouseTriggerHook mouseTrigger = new();
     private string currentState = "idle";
     private string state { get => currentState; set { currentState = value; relay?.SetState(value); } }
     private int cancellationVersion;
-    private bool submitAfterPaste, clipboardListening;
-    private int suppressClipboard;
-    private uint ignoreClipSequence;
-    private string lastClipHash = "";
+    private bool submitAfterPaste;
 
     public Overlay(Settings settings)
     {
@@ -250,7 +246,8 @@ public sealed class Overlay : Window, IDisposable
     {
         new WindowInteropHelper(this).EnsureHandle();
         bool registered = RegisterHotKey(hwnd, 1, settings.Modifiers | 0x4000, settings.Key);
-        clipboardListening = AddClipboardFormatListener(hwnd);
+        mouseTrigger.Triggered += () => Dispatcher.BeginInvoke(() => _ = Toggle());
+        mouseTrigger.Configure(settings.MouseTrigger);
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("Phone / connection…", null, (_, _) => Dispatcher.Invoke(OpenRelay));
         menu.Items.Add("Settings…", null, (_, _) => Dispatcher.Invoke(OpenSettings));
@@ -263,7 +260,6 @@ public sealed class Overlay : Window, IDisposable
         timer.Start();
         relay = new RelayHost { SignalingServers = settings.SignalingServers, IceServersProvider = ct => settings.ResolveIceServersJson(ct) };
         relay.StereoAudio += virtualMicrophone.PushStereo;
-        relay.ClipboardReceived += (mime, data) => Dispatcher.BeginInvoke(() => ApplyRemoteClipboard(mime, data));
         relay.Command += command => Dispatcher.BeginInvoke(async () =>
         {
             if (command == "cancel") Cancel();
@@ -294,91 +290,7 @@ public sealed class Overlay : Window, IDisposable
     {
         if (message == 0x0312 && wParam.ToInt32() == 1) { handled = true; _ = Toggle(); }
         if (message == 0x0312 && wParam.ToInt32() == 2 && IsVisible) { handled = true; Cancel(); }
-        if (message == 0x031D) _ = OnLocalClipboardChanged();
         return IntPtr.Zero;
-    }
-    private async Task OnLocalClipboardChanged()
-    {
-        if (suppressClipboard > 0 || relay?.Connected != true) return;
-        uint seq = GetClipboardSequenceNumber();
-        if (seq == ignoreClipSequence) return;
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            if (attempt > 0) await Task.Delay(50);
-            if (suppressClipboard > 0 || relay?.Connected != true) return;
-            try
-            {
-                byte[]? png = TryReadClipboardPng();
-                if (png != null)
-                {
-                    string hash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(png));
-                    if (hash == lastClipHash) return;
-                    lastClipHash = hash;
-                    relay.SendClipboard("image/png", png);
-                    return;
-                }
-                if (Forms.Clipboard.ContainsText())
-                {
-                    string text = Forms.Clipboard.GetText();
-                    if (string.IsNullOrEmpty(text)) return;
-                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text);
-                    if (bytes.Length > 10 * 1024 * 1024) return;
-                    string hash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(bytes));
-                    if (hash == lastClipHash) return;
-                    lastClipHash = hash;
-                    relay.SendClipboard("text/plain", bytes);
-                    return;
-                }
-                return;
-            }
-            catch (Exception ex) { if (attempt == 2) relay?.Trace("clip-read-err " + ex.Message); }
-        }
-    }
-    private static byte[]? TryReadClipboardPng()
-    {
-        var data = Forms.Clipboard.GetDataObject();
-        if (data != null && data.GetDataPresent("PNG") && data.GetData("PNG") is Stream pngStream)
-        {
-            using var ms = new MemoryStream();
-            pngStream.CopyTo(ms);
-            if (ms.Length is > 0 and <= 10 * 1024 * 1024) return ms.ToArray();
-        }
-        if (Forms.Clipboard.ContainsImage())
-        {
-            using var img = Forms.Clipboard.GetImage();
-            if (img == null) return null;
-            using var ms = new MemoryStream();
-            img.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-            if (ms.Length is > 0 and <= 10 * 1024 * 1024) return ms.ToArray();
-        }
-        return null;
-    }
-    private void ApplyRemoteClipboard(string mime, byte[] data)
-    {
-        try
-        {
-            string hash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(data));
-            if (hash == lastClipHash) return;
-            lastClipHash = hash;
-            suppressClipboard++;
-            try
-            {
-                if (mime.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
-                {
-                    using var ms = new MemoryStream(data);
-                    var bmp = new BitmapImage();
-                    bmp.BeginInit(); bmp.CacheOption = BitmapCacheOption.OnLoad; bmp.StreamSource = ms; bmp.EndInit(); bmp.Freeze();
-                    Clipboard.SetImage(bmp);
-                }
-                else
-                {
-                    Clipboard.SetText(System.Text.Encoding.UTF8.GetString(data));
-                }
-                ignoreClipSequence = GetClipboardSequenceNumber();
-            }
-            finally { suppressClipboard--; }
-        }
-        catch { }
     }
     private async Task Toggle()
     {
@@ -473,7 +385,7 @@ public sealed class Overlay : Window, IDisposable
         if (GetForegroundWindow() != target) { ShowError("Cannot focus the original window. Copy your text instead."); return; }
         string text = transcript.Text;
         DataObject? oldData = SnapshotClipboard();
-        suppressClipboard++; try { Clipboard.SetText(text); ignoreClipSequence = GetClipboardSequenceNumber(); } finally { suppressClipboard--; }
+        Clipboard.SetText(text);
         uint sequence = GetClipboardSequenceNumber();
         static Input Key(ushort key, bool up = false) => new() { Type = 1, Data = new InputUnion { Keyboard = new KeyboardInput { Key = key, Flags = up ? 2u : 0u } } };
         var input = new[] { Key(0x11), Key(0x56), Key(0x56, true), Key(0x11, true) };
@@ -496,7 +408,7 @@ public sealed class Overlay : Window, IDisposable
         submitAfterPaste = false;
         state = "idle"; Hide();
         await Task.Delay(1000);
-        if (oldData != null && GetClipboardSequenceNumber() == sequence) { suppressClipboard++; try { Clipboard.SetDataObject(oldData, true); ignoreClipSequence = GetClipboardSequenceNumber(); } catch { } finally { suppressClipboard--; } }
+        if (oldData != null && GetClipboardSequenceNumber() == sequence) try { Clipboard.SetDataObject(oldData, true); } catch { }
     }
     private static bool ModifiersPressed() => (GetAsyncKeyState(0x10) & 0x8000) != 0 || (GetAsyncKeyState(0x11) & 0x8000) != 0 ||
         (GetAsyncKeyState(0x12) & 0x8000) != 0 || (GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0;
@@ -589,6 +501,11 @@ public sealed class Overlay : Window, IDisposable
             shortcut.Text = new Settings { Modifiers = modifiers, Key = key }.Shortcut;
         };
         panel.Children.Add(shortcut);
+        panel.Children.Add(new TextBlock { Text = "Mouse trigger (swallows release on hold/chord so apps don't navigate)" });
+        var mouseModes = new (string Id, string Label)[] { ("hold-forward", "Long-press Forward (upper side button)"), ("hold-back", "Long-press Back (lower side button)"), ("chord", "Back + Forward together"), ("off", "Off") };
+        var mouseBox = new ComboBox { Margin = new Thickness(0, 6, 0, 14), Padding = new Thickness(6), ItemsSource = mouseModes.Select(m => m.Label).ToArray() };
+        mouseBox.SelectedIndex = Math.Max(0, Array.FindIndex(mouseModes, m => m.Id == settings.MouseTrigger));
+        panel.Children.Add(mouseBox);
         panel.Children.Add(new TextBlock { Text = "Codex login file (credentials stay in this file)" });
         var auth = new TextBox { Text = settings.AuthFile, Margin = new Thickness(0, 6, 0, 6), Padding = new Thickness(6) };
         panel.Children.Add(auth);
@@ -619,7 +536,7 @@ public sealed class Overlay : Window, IDisposable
                 RegisterHotKey(hwnd, 1, settings.Modifiers | 0x4000, settings.Key);
                 MessageBox.Show(window, "That shortcut is unavailable. Choose another combination."); return;
             }
-            settings.Modifiers = modifiers; settings.Key = key; settings.AuthFile = auth.Text; settings.Language = language.Text; settings.CloudflareTurnKeyId = cfKeyId.Text.Trim(); settings.CloudflareTurnApiToken = cfToken.Text.Trim(); settings.TurnUrl = turnUrl.Text.Trim(); settings.TurnUsername = turnUser.Text.Trim(); settings.TurnCredential = turnPass.Text.Trim(); _ = relay?.RefreshIceServers();
+            settings.Modifiers = modifiers; settings.Key = key; settings.MouseTrigger = mouseModes[Math.Max(0, mouseBox.SelectedIndex)].Id; mouseTrigger.Configure(settings.MouseTrigger); settings.AuthFile = auth.Text; settings.Language = language.Text; settings.CloudflareTurnKeyId = cfKeyId.Text.Trim(); settings.CloudflareTurnApiToken = cfToken.Text.Trim(); settings.TurnUrl = turnUrl.Text.Trim(); settings.TurnUsername = turnUser.Text.Trim(); settings.TurnCredential = turnPass.Text.Trim(); _ = relay?.RefreshIceServers();
             try { settings.Save(); if (tray != null) tray.Text = "Nightcall — " + settings.Shortcut; window.Close(); }
             catch (Exception error) { MessageBox.Show(window, "Could not save settings: " + error.Message); }
         }));
@@ -640,11 +557,10 @@ public sealed class Overlay : Window, IDisposable
     public void Dispose()
     {
         if (disposed) return; disposed = true; timer.Stop(); cancellation?.Cancel();
-        relayWindow?.Close(); installServer?.Dispose(); relay?.Dispose(); virtualMicrophone.Dispose();
+        relayWindow?.Close(); installServer?.Dispose(); relay?.Dispose(); virtualMicrophone.Dispose(); mouseTrigger.Dispose();
         recorder?.Dispose(); transcriber.Dispose(); cancellation?.Dispose();
         if (hwnd != IntPtr.Zero) UnregisterHotKey(hwnd, 1);
         if (hwnd != IntPtr.Zero) UnregisterHotKey(hwnd, 2);
-        if (hwnd != IntPtr.Zero && clipboardListening) { RemoveClipboardFormatListener(hwnd); clipboardListening = false; }
         NightcallTheme.Changed -= UpdateTrayIcon; tray?.Dispose(); settingsWindow?.Close(); Close();
     }
 }

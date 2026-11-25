@@ -12,6 +12,7 @@ public sealed class Settings
 {
     public uint Modifiers { get; set; } = 3; // Ctrl + Alt
     public uint Key { get; set; } = 0x20;
+    public string MouseTrigger { get; set; } = "hold-forward";
     public string AuthFile { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
     public string Language { get; set; } = "";
     public string[] SignalingServers { get; set; } = DirectPeer.DefaultServers;
